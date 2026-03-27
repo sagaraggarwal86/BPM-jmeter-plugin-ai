@@ -1,0 +1,86 @@
+package io.github.sagaraggarwal86.jmeter.bpm.collectors;
+
+import io.github.sagaraggarwal86.jmeter.bpm.config.BpmPropertiesManager;
+import io.github.sagaraggarwal86.jmeter.bpm.model.DerivedMetrics;
+import io.github.sagaraggarwal86.jmeter.bpm.model.WebVitalsResult;
+import io.github.sagaraggarwal86.jmeter.bpm.model.ConsoleResult;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Layer 1 unit tests for SLA threshold classification (green/amber/red).
+ */
+@DisplayName("SLA Classification")
+class SlaClassificationTest {
+
+    private DerivedMetricsCalculator calculator;
+
+    @BeforeEach
+    void setUp() {
+        BpmPropertiesManager props = new BpmPropertiesManager() {
+            @Override Path resolvePropertiesPath() {
+                return Path.of(System.getProperty("java.io.tmpdir"), "bpm-sla-test.properties");
+            }
+            @Override String getJMeterProperty(String key) { return null; }
+        };
+        props.load();
+        calculator = new DerivedMetricsCalculator(props);
+    }
+
+    @Test
+    @DisplayName("Score ≥ 90 is Good (green), 50-89 is NeedsWork, < 50 is Poor")
+    void scoreClassification_threeRanges() {
+        // Good: all good vitals → score = 100
+        assertEquals(100, calculator.computePerformanceScore(1000, 1000, 0.05, 500, 0));
+        // NeedsWork: mix of good and poor → 50-89
+        int mixed = calculator.computePerformanceScore(3500, 2500, 0.2, 1500, 3);
+        assertTrue(mixed >= 50 && mixed < 90, "Mixed vitals should produce NeedsWork score, got: " + mixed);
+        // Poor: all poor → score = 0
+        assertEquals(0, calculator.computePerformanceScore(5000, 4000, 0.5, 2000, 10));
+    }
+
+    @Test
+    @DisplayName("LCP good ≤ 2500, needs work ≤ 4000, poor > 4000")
+    void lcpThresholds_affectScore() {
+        // LCP = 2500 (good boundary) → LCP score = 100
+        int goodEdge = calculator.computePerformanceScore(2500, 0, 0, 0, 0);
+        // LCP = 4000 (poor boundary) → LCP score = 50
+        int needsWorkEdge = calculator.computePerformanceScore(4000, 0, 0, 0, 0);
+        // LCP = 4001 → LCP score = 0
+        int poor = calculator.computePerformanceScore(4001, 0, 0, 0, 0);
+
+        assertTrue(goodEdge > needsWorkEdge);
+        assertTrue(needsWorkEdge > poor);
+    }
+
+    @Test
+    @DisplayName("Error count: 0 = Good, 1-5 = NeedsWork, > 5 = Poor")
+    void errorScoring_threeRanges() {
+        // 0 errors → error score = 100 → contributes 15 points
+        int noErrors = calculator.computePerformanceScore(0, 0, 0, 0, 0);
+        // 3 errors → error score = 50 → contributes 7.5 points
+        int someErrors = calculator.computePerformanceScore(0, 0, 0, 0, 3);
+        // 10 errors → error score = 0 → contributes 0 points
+        int manyErrors = calculator.computePerformanceScore(0, 0, 0, 0, 10);
+
+        assertTrue(noErrors > someErrors);
+        assertTrue(someErrors > manyErrors);
+    }
+
+    @Test
+    @DisplayName("CLS good ≤ 0.1, needs work ≤ 0.25, poor > 0.25")
+    void clsThresholds_affectScore() {
+        int good = calculator.computePerformanceScore(0, 0, 0.1, 0, 0);
+        int needsWork = calculator.computePerformanceScore(0, 0, 0.25, 0, 0);
+        int poor = calculator.computePerformanceScore(0, 0, 0.26, 0, 0);
+
+        assertTrue(good >= needsWork);
+        assertTrue(needsWork > poor);
+    }
+}
