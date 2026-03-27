@@ -183,4 +183,60 @@ public final class JsSnippets {
               return JSON.stringify({resources: resources});
             })();
             """;
+
+    // ── Console event capture ────────────────────────────────────────────────────────────────  // CHANGED — new constant
+
+    /**
+     * JavaScript executed once at CDP session initialisation to intercept
+     * {@code console.error()} and {@code console.warn()} calls.
+     *
+     * <p>Captured messages are stored in {@code window.__bpm_console}, a plain
+     * array of {@code {level, text}} objects. The array is drained and cleared
+     * by {@link #DRAIN_CONSOLE_BUFFER} during each collection cycle.</p>
+     *
+     * <p>Only {@code error} and {@code warn} levels are intercepted — other
+     * levels ({@code log}, {@code info}, {@code debug}) are ignored to keep
+     * the buffer small and focused on actionable diagnostics.</p>
+     *
+     * <p>The script is idempotent: re-injecting overwrites the hooks and
+     * resets the buffer.</p>
+     */
+    public static final String CONSOLE_CAPTURE_HOOK = """
+            (function() {
+              window.__bpm_console = [];
+              var origError = console.error;
+              var origWarn  = console.warn;
+              console.error = function() {
+                try {
+                  var msg = Array.prototype.slice.call(arguments).join(' ');
+                  window.__bpm_console.push({level: 'error', text: msg.substring(0, 2048)});
+                } catch(e) {}
+                return origError.apply(console, arguments);
+              };
+              console.warn = function() {
+                try {
+                  var msg = Array.prototype.slice.call(arguments).join(' ');
+                  window.__bpm_console.push({level: 'warning', text: msg.substring(0, 2048)});
+                } catch(e) {}
+                return origWarn.apply(console, arguments);
+              };
+            })();
+            """;
+
+    /**                                                                                         // CHANGED — new constant
+     * JavaScript that drains the browser-side console message buffer and clears it.
+     *
+     * <p>Returns a JavaScript array of {@code {level, text}} objects. Selenium converts
+     * this to a {@code List<Map<String, Object>>} on the Java side.</p>
+     *
+     * <p>After draining, {@code window.__bpm_console} is reset to an empty array
+     * to prevent double-counting on the next collection cycle.</p>
+     */
+    public static final String DRAIN_CONSOLE_BUFFER = """
+            (function() {
+              var buf = window.__bpm_console || [];
+              window.__bpm_console = [];
+              return buf;
+            })();
+            """;
 }
