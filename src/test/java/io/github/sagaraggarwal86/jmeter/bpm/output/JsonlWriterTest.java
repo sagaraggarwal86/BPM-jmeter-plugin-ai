@@ -101,7 +101,7 @@ class JsonlWriterTest {
     }
 
     @Test
-    @DisplayName("open() overwrites existing file content")
+    @DisplayName("open(path) overwrites existing file content")
     void open_overwritesExistingFile() throws IOException {
         Path path = tempDir.resolve("overwrite.jsonl");
         Files.writeString(path, "old content\n");
@@ -115,5 +115,27 @@ class JsonlWriterTest {
         assertEquals(1, lines.size());
         assertFalse(lines.get(0).contains("old content"));
         assertTrue(lines.get(0).contains("\"New\""));
+    }
+
+    @Test
+    @DisplayName("open(path, true) appends records after existing content") // CHANGED: Feature #3 — append mode
+    void open_appendMode_appendsToExistingFile() throws IOException {
+        Path path = tempDir.resolve("append.jsonl");
+
+        // First run: write one record
+        JsonlWriter writer = new JsonlWriter();
+        writer.open(path, false);
+        writer.write(createMinimalResult("First"));
+        writer.close();
+
+        // Second run: append a second record to the same file
+        writer.open(path, true);
+        writer.write(createMinimalResult("Second"));
+        writer.close();
+
+        List<String> lines = Files.readAllLines(path);
+        assertEquals(2, lines.size(), "Append mode must preserve existing records");
+        assertTrue(lines.get(0).contains("\"First\""));
+        assertTrue(lines.get(1).contains("\"Second\""));
     }
 }
