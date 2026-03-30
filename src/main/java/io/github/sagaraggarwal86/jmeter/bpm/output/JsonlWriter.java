@@ -48,12 +48,29 @@ public final class JsonlWriter {
     }
 
     /**
-     * Opens the JSONL output file for writing. Overwrites any existing file.
+     * Opens the JSONL output file for writing, overwriting any existing content.
+     * Delegates to {@link #open(Path, boolean)} with {@code append=false}.
      *
      * @param path the output file path
      * @throws IOException if the file cannot be created or opened
      */
     public void open(Path path) throws IOException {
+        open(path, false);
+    }
+
+    /**
+     * Opens the JSONL output file for writing.
+     *
+     * <p>When {@code append} is {@code false} (default), any existing file is truncated
+     * (fresh write for a new test run). When {@code true}, new records are appended after
+     * the existing content — used when the user selects "Append" in the file-exists dialog.</p>
+     *
+     * @param path   the output file path
+     * @param append {@code true} to append to an existing file; {@code false} to overwrite
+     * @throws IOException if the file cannot be created or opened
+     */
+    // CHANGED: Feature #3 — append mode support for file-exists dialog
+    public void open(Path path, boolean append) throws IOException {
         this.outputPath = path;
         this.recordsSinceFlush = 0;
         // Ensure parent directories exist
@@ -61,9 +78,14 @@ public final class JsonlWriter {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        // Overwrite (fresh for new test) — TRUNCATE_EXISTING + CREATE + WRITE
-        this.writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        if (append) {
+            this.writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+        } else {
+            // Overwrite (fresh for new test) — TRUNCATE_EXISTING + CREATE + WRITE
+            this.writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        }
     }
 
     /**

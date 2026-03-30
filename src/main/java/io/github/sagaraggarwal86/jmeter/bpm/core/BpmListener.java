@@ -7,7 +7,7 @@ import io.github.sagaraggarwal86.jmeter.bpm.error.LogOnceTracker;
 import io.github.sagaraggarwal86.jmeter.bpm.gui.BpmListenerGui; // CHANGED: §5.5 — GUI lifecycle wiring
 import io.github.sagaraggarwal86.jmeter.bpm.model.*;
 import io.github.sagaraggarwal86.jmeter.bpm.output.JsonlWriter;
-import io.github.sagaraggarwal86.jmeter.bpm.output.SummaryJsonWriter;
+// SummaryJsonWriter intentionally removed — Feature #1: summary JSON generation disabled
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmDebugLogger;
 import io.github.sagaraggarwal86.jmeter.bpm.util.ConsoleSanitizer;
@@ -22,11 +22,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
+import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -62,6 +62,13 @@ public class BpmListener extends AbstractTestElement
     private static final long serialVersionUID = 1L;
     private static final Logger log = LoggerFactory.getLogger(BpmListener.class);
 
+    /**
+     * Outcome of the file-exists check performed at test start.
+     * Determines whether the JSONL writer opens in append or overwrite mode,
+     * or whether the test should be stopped before writing begins.
+     */ // CHANGED: Feature #3 — file-exists dialog
+    private enum FileOpenMode { APPEND, OVERWRITE, DONT_START }
+
     // CHANGED: Static reference to the instance that received testStarted() — cloned instances
     // that receive sampleOccurred() without testStarted() delegate to this active instance.
     private static volatile BpmListener activeInstance;
@@ -79,7 +86,7 @@ public class BpmListener extends AbstractTestElement
     private transient BpmPropertiesManager propertiesManager;
     private transient BpmDebugLogger debugLogger;
     private transient JsonlWriter jsonlWriter;
-    private transient SummaryJsonWriter summaryJsonWriter;
+    // summaryJsonWriter removed — Feature #1: summary JSON generation disabled
     private transient BpmErrorHandler errorHandler;
     private transient LogOnceTracker logOnceTracker;
     private transient CdpSessionManager sessionManager;
@@ -153,12 +160,30 @@ public class BpmListener extends AbstractTestElement
 
         // Initialize writers
         jsonlWriter = new JsonlWriter();
-        summaryJsonWriter = new SummaryJsonWriter();
+        // summaryJsonWriter not initialized — Feature #1: summary JSON generation disabled
 
         String outputPath = resolveOutputPath();
         try {
-            jsonlWriter.open(Path.of(outputPath));
-            log.info("BPM: JSONL output file: {}", outputPath);
+            Path outputFile = Path.of(outputPath);
+            boolean append = false;
+            if (Files.exists(outputFile)) { // CHANGED: Feature #3 (prev session) — file-exists check
+                // CHANGED: Feature #2 — only show the dialog when the path was explicitly provided
+                // by the user (via -Jbpm.output or the GUI field). When the path is the default
+                // fallback, always overwrite silently — no dialog shown.
+                if (isUserProvidedOutputPath()) {
+                    FileOpenMode mode = resolveFileOpenMode(outputFile);
+                    if (mode == FileOpenMode.DONT_START) {
+                        log.info("BPM: Test cancelled — output file conflict: {}", outputFile);
+                        stopTestEngine();
+                        return;
+                    }
+                    append = (mode == FileOpenMode.APPEND);
+                } else {
+                    log.info("BPM: Default output file exists — overwriting: {}", outputFile);
+                }
+            }
+            jsonlWriter.open(outputFile, append); // CHANGED: Feature #3
+            log.info("BPM: JSONL output file: {} ({})", outputPath, append ? "append" : "overwrite");
         } catch (IOException e) {
             log.warn("BPM: Failed to open JSONL output file: {}. JSONL writing disabled.", outputPath, e);
         }
@@ -313,8 +338,7 @@ public class BpmListener extends AbstractTestElement
                 jsonlWriter.flush();
             }
 
-            // Write summary JSON
-            writeSummaryJson();
+            // Summary JSON intentionally skipped — Feature #1: generation disabled
 
             // Print log summary
             printLogSummary();
@@ -422,10 +446,28 @@ public class BpmListener extends AbstractTestElement
     // ── Internal: Output path resolution ──────────────────────────────────────────────────
 
     /**
-     * Resolves the JSONL output path using the defined priority chain: // CHANGED: P3 — GUI field is now in the chain
+     * Returns {@code true} when the JSONL output path was explicitly set by the user — either
+     * via the {@code -Jbpm.output} CLI flag or via the GUI filename field. Returns {@code false}
+     * when the path is the bpm.properties/default fallback.
+     *
+     * <p>Used by {@link #testStarted(String)} to decide whether a file-exists dialog should be
+     * shown. Default-path files are always silently overwritten; only user-provided paths trigger
+     * the Append/Overwrite/Don't-Start dialog.</p>
+     */ // CHANGED: Feature #2
+    private boolean isUserProvidedOutputPath() {
+        String jFlag = propertiesManager.getJMeterProperty("bpm.output");
+        if (jFlag != null && !jFlag.isBlank()) {
+            return true;
+        }
+        String guiPath = getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "").trim();
+        return !guiPath.isEmpty();
+    }
+
+    /**
+     * Resolves the effective JSONL output file path, applying priority:
      * {@code -Jbpm.output (highest) → GUI TestElement property → bpm.properties/default (lowest)}.
      */
-    private String resolveOutputPath() {
+    private String resolveOutputPath() { // CHANGED: restored missing Javadoc opening
         // 1. -J flag (CLI override — highest priority)
         String jFlag = propertiesManager.getJMeterProperty("bpm.output");
         if (jFlag != null && !jFlag.isBlank()) {
@@ -438,6 +480,74 @@ public class BpmListener extends AbstractTestElement
         }
         // 3. bpm.properties default (lowest priority)
         return propertiesManager.getOutputPath();
+    }
+
+    /**
+     * Determines how to handle an existing JSONL output file.
+     *
+     * <p>In CLI mode (no GuiPackage): always appends silently — no dialog available.</p>
+     * <p>In GUI mode: blocks the calling thread via {@code SwingUtilities.invokeAndWait}
+     * to show a modal JOptionPane. Returns {@link FileOpenMode#DONT_START} if the dialog
+     * is dismissed without a selection.</p>
+     *
+     * @param outputFile the file that already exists on disk
+     * @return the chosen open mode; never null
+     */ // CHANGED: Feature #3
+    private FileOpenMode resolveFileOpenMode(Path outputFile) {
+        try {
+            if (org.apache.jmeter.gui.GuiPackage.getInstance() == null) {
+                // CLI mode — append silently; no interactive dialog available
+                log.info("BPM: Output file exists — appending (CLI mode): {}", outputFile);
+                return FileOpenMode.APPEND;
+            }
+        } catch (Exception e) {
+            return FileOpenMode.APPEND;
+        }
+
+        // GUI mode — ask the user on the EDT, block until answered
+        int[] choice = {JOptionPane.CLOSED_OPTION}; // default: treat close as Don't Start
+        try {
+            String[] options = {"Append", "Overwrite", "Don't Start"};
+            Runnable showDialog = () -> choice[0] = JOptionPane.showOptionDialog(
+                    null,
+                    "Output file already exists:\n" + outputFile
+                            + "\n\nWhat would you like to do?",
+                    "BPM — Output File Exists",
+                    JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.QUESTION_MESSAGE,
+                    null,
+                    options,
+                    options[0]);
+            if (SwingUtilities.isEventDispatchThread()) {
+                showDialog.run();
+            } else {
+                SwingUtilities.invokeAndWait(showDialog);
+            }
+        } catch (Exception e) {
+            log.warn("BPM: Failed to show file-exists dialog: {}", e.getMessage());
+        }
+
+        return switch (choice[0]) {
+            case 0 -> FileOpenMode.APPEND;
+            case 1 -> FileOpenMode.OVERWRITE;
+            default -> FileOpenMode.DONT_START;
+        };
+    }
+
+    /**
+     * Requests a graceful test stop via the JMeter engine.
+     * Silently no-ops if the engine reference is unavailable.
+     */ // CHANGED: Feature #3
+    private void stopTestEngine() {
+        try {
+            org.apache.jmeter.engine.JMeterEngine engine =
+                    org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
+            if (engine != null) {
+                engine.stopTest(false); // graceful — let current samplers finish
+            }
+        } catch (Exception e) {
+            log.warn("BPM: Could not stop test engine: {}", e.getMessage());
+        }
     }
 
     // ── Internal: Selenium check ───────────────────────────────────────────────────────────
@@ -691,33 +801,7 @@ public class BpmListener extends AbstractTestElement
     /**
      * Writes the bpm-summary.json file from label aggregates.
      */
-    private void writeSummaryJson() {
-        if (labelAggregates == null || labelAggregates.isEmpty()) {
-            return;
-        }
-        if (jsonlWriter == null || jsonlWriter.getOutputPath() == null) {
-            return;
-        }
-
-        List<Map<String, Object>> labelStats = new ArrayList<>();
-        for (Map.Entry<String, LabelAggregate> entry : labelAggregates.entrySet()) {
-            LabelAggregate agg = entry.getValue();
-            Map<String, Object> stat = new HashMap<>();
-            stat.put("label", entry.getKey());
-            stat.put("score", agg.getAverageScore()); // null when no scored samples — serializes as JSON null // CHANGED: per-action accuracy
-            stat.put("lcp", agg.getAverageLcp());
-            stat.put("bottleneck", agg.getPrimaryImprovementArea()); // CHANGED: renamed accessor
-            stat.put("samples", agg.getSampleCount());
-            labelStats.add(stat);
-        }
-
-        summaryJsonWriter.write(
-                jsonlWriter.getOutputPath(),
-                labelStats,
-                propertiesManager.getSlaLcpPoor(),
-                propertiesManager.getSlaScorePoor()
-        );
-    }
+    // writeSummaryJson() removed — Feature #1: summary JSON generation disabled
 
     /**
      * Prints the log summary table per design doc section 4.4.

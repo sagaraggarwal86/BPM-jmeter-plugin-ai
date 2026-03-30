@@ -15,8 +15,14 @@ import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.*;
 import java.awt.*;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import javax.swing.text.AbstractDocument;
+import javax.swing.text.AttributeSet;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.DocumentFilter;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -71,6 +77,13 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     private transient io.github.sagaraggarwal86.jmeter.bpm.config.BpmPropertiesManager propertiesRef;
     private boolean testRunning;
     private Instant testStartTime;
+    /** True while configure() is populating fields — suppresses spurious applyAllFilters() calls
+     *  fired by setSelected/setSelectedItem listeners during programmatic configuration. */
+    private boolean configuringElement = false; // CHANGED: Defect #2 guard
+
+    /** Raw BpmResult records from the current test or loaded file — source of truth for retroactive filter rebuilds. */
+    // CHANGED: Defect #2 — enables retroactive offset re-filtering by rebuilding aggregates from raw records
+    private final List<BpmResult> allRawResults = new ArrayList<>();
 
     // All 18 TableColumn objects stored at init — used for add/remove column visibility
     private TableColumn[] allColumns;
@@ -149,7 +162,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
         JPanel inner = new JPanel(new BorderLayout(4, 0));
         inner.add(new JLabel("Filename"), BorderLayout.WEST);
-        filenameField = new JTextField(BpmConstants.DEFAULT_OUTPUT_FILENAME, 30);
+        filenameField = new JTextField("", 30); // CHANGED: Feature #2 — initially empty; default resolved at runtime
+        filenameField.addActionListener(e -> loadFileFromField()); // CHANGED: Feature #3 — Enter key loads file if it exists
         inner.add(filenameField, BorderLayout.CENTER);
         browseButton = new JButton("Browse..."); // CHANGED: Feature #2 — stored as field for disable during test
         browseButton.addActionListener(e -> browseFile());
@@ -186,10 +200,12 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
         fieldset.add(new JLabel("Start Offset (s):"));
         startOffsetField = new JTextField(4);
+        applyPositiveIntegerFilter(startOffsetField); // CHANGED: Defect #2 — digits-only validation
         fieldset.add(startOffsetField);
 
         fieldset.add(new JLabel("End Offset (s):"));
         endOffsetField = new JTextField(4);
+        applyPositiveIntegerFilter(endOffsetField);   // CHANGED: Defect #2 — digits-only validation
         fieldset.add(endOffsetField);
 
         columnSelector = new ColumnSelectorPopup(e -> applyColumnVisibility());
@@ -208,16 +224,20 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         includeExcludeCombo = new JComboBox<>(new String[]{"Include", "Exclude"});
         fieldset.add(includeExcludeCombo);
 
-        // Apply button: re-evaluates transaction name + regex + include/exclude against // CHANGED: Feature #1
-        // already-collected rows. Offset filtering is applied at ingest time in drainGuiQueue.
-        JButton applyFilterButton = new JButton("Apply");
-        applyFilterButton.setToolTipText(
-                "Filter visible rows by transaction name. Offset filters apply to live data only.");
-        applyFilterButton.addActionListener(e -> applyTransactionFilter());
-        fieldset.add(applyFilterButton);
-
-        // Enter key on transactionNamesField also triggers filter // CHANGED: Feature #1
-        transactionNamesField.addActionListener(e -> applyTransactionFilter());
+        // CHANGED: Feature #2 — Apply button removed.
+        // All filter fields trigger applyAllFilters() immediately on focus-lost or Enter.
+        // Combo and checkbox trigger on selection/state change.
+        FocusAdapter filterFocus = new FocusAdapter() {
+            @Override public void focusLost(FocusEvent e) { applyAllFilters(); }
+        };
+        startOffsetField.addFocusListener(filterFocus);
+        startOffsetField.addActionListener(e -> applyAllFilters());      // Enter key
+        endOffsetField.addFocusListener(filterFocus);
+        endOffsetField.addActionListener(e -> applyAllFilters());        // Enter key
+        transactionNamesField.addFocusListener(filterFocus);
+        transactionNamesField.addActionListener(e -> applyAllFilters()); // Enter key
+        regexCheckBox.addItemListener(e -> applyAllFilters());
+        includeExcludeCombo.addActionListener(e -> applyAllFilters());
 
         return fieldset;
     }
@@ -280,6 +300,16 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         // Return a brand-new listener with no data — do NOT wire to any existing active instance. // CHANGED: Bug #2
         BpmListener listener = new BpmListener();
         modifyTestElement(listener);
+        // CHANGED: Defect #1 (prev session) — strip filename so every new BPM Listener starts empty.
+        // CHANGED: Defect #3 — also strip the five filter properties; modifyTestElement() copies the
+        // current GUI state (from a previously-configured listener) into the new element, so without
+        // these removes, configure() would inherit the old listener's filter values.
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH);
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_START_OFFSET);
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_END_OFFSET);
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_TRANSACTION_NAMES);
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_REGEX);
+        listener.removeProperty(BpmConstants.TEST_ELEMENT_INCLUDE);
         return listener;
     }
 
@@ -299,32 +329,52 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
     @Override
     public void configure(TestElement element) {
-        super.configure(element);
-        filenameField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, BpmConstants.DEFAULT_OUTPUT_FILENAME));
-        startOffsetField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_START_OFFSET, ""));
-        endOffsetField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_END_OFFSET, ""));
-        transactionNamesField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_TRANSACTION_NAMES, ""));
-        regexCheckBox.setSelected(element.getPropertyAsBoolean(BpmConstants.TEST_ELEMENT_REGEX, false));
-        includeExcludeCombo.setSelectedItem(
-                element.getPropertyAsBoolean(BpmConstants.TEST_ELEMENT_INCLUDE, true) ? "Include" : "Exclude");
-        if (element instanceof BpmListener listener) {
-            // Only wire to listener if it already has active data. // CHANGED: Bug #2
-            // A freshly created listener has a null queue — don't inherit data from
-            // any existing active instance; just show a blank GUI for the new listener.
-            boolean hasActiveData = listener.getGuiUpdateQueue() != null;
-            if (hasActiveData) {
-                this.listenerRef = listener;
-                this.propertiesRef = listener.getPropertiesManager();
-                if (!updateTimer.isRunning()) {
-                    testRunning = true;
-                    updateTimer.start();
+        configuringElement = true; // CHANGED: Defect #2 — suppress applyAllFilters() during field population
+        try {
+            super.configure(element);
+            filenameField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "")); // CHANGED: Feature #2 — default empty, not DEFAULT_OUTPUT_FILENAME
+            startOffsetField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_START_OFFSET, ""));
+            endOffsetField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_END_OFFSET, ""));
+            transactionNamesField.setText(element.getPropertyAsString(BpmConstants.TEST_ELEMENT_TRANSACTION_NAMES, ""));
+            regexCheckBox.setSelected(element.getPropertyAsBoolean(BpmConstants.TEST_ELEMENT_REGEX, false));
+            includeExcludeCombo.setSelectedItem(
+                    element.getPropertyAsBoolean(BpmConstants.TEST_ELEMENT_INCLUDE, true) ? "Include" : "Exclude");
+            if (element instanceof BpmListener listener) {
+                // Only wire to listener if it already has active data. // CHANGED: Bug #2
+                // A freshly created listener has a null queue — don't inherit data from
+                // any existing active instance; just show a blank GUI for the new listener.
+                boolean hasActiveData = listener.getGuiUpdateQueue() != null;
+                if (hasActiveData) {
+                    this.listenerRef = listener;
+                    this.propertiesRef = listener.getPropertiesManager();
+                    if (!updateTimer.isRunning()) {
+                        testRunning = true;
+                        updateTimer.start();
+                    }
+                } else {
+                    this.listenerRef = listener;
+                    this.propertiesRef = null;
+                    // CHANGED: Defect #4 — when user clicks the BPM Listener during a running test,
+                    // JMeter calls configure() with the original element (guiUpdateQueue == null,
+                    // so hasActiveData is false). Without this guard, clearDisplayOnly() would stop
+                    // the update timer and wipe a table that is actively being populated.
+                    // Fix: if a live test is in progress, wire to the active instance instead and
+                    // keep (or restart) the timer — never call clearDisplayOnly().
+                    BpmListener active = BpmListener.getActiveInstance();
+                    if (active != null) {
+                        this.listenerRef = active;
+                        this.propertiesRef = active.getPropertiesManager();
+                        if (!updateTimer.isRunning()) {
+                            testRunning = true;
+                            updateTimer.start();
+                        }
+                    } else if (tableModel.getRowCount() == 0) {
+                        clearDisplayOnly();
+                    }
                 }
-            } else {
-                // Fresh listener — sever any stale reference and reset the display // CHANGED: Bug #2
-                this.listenerRef = listener;
-                this.propertiesRef = null;
-                clearDisplayOnly(); // clear GUI state without calling listener.clearData()
             }
+        } finally {
+            configuringElement = false; // CHANGED: Defect #2 — always release guard
         }
     }
 
@@ -335,9 +385,21 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         clearDisplayOnly();
     }
 
-    /** Resets only the GUI display without touching the backend listener state. // CHANGED: Bug #2 helper
-     *  Used both by clearData() and by configure() when wiring a fresh listener. */
+    /**
+     * Resets only the GUI display without touching the backend listener state or any output file.
+     * Used both by clearData() and by configure() when wiring a fresh listener.
+     *
+     * <p>Filter fields (start/end offset, transaction names, regex, include/exclude) are reset
+     * to their defaults here. The reset is wrapped in a {@code configuringElement} guard to
+     * suppress the {@link #applyAllFilters()} listeners that fire on setSelected/setSelectedItem.</p>
+     *
+     * <p>The filename field is intentionally <em>not</em> cleared — Defect #2 confirmed correct.</p>
+     *
+     * <p>NOTE: clearData()/clearDisplayOnly() never write to or truncate the JSONL file or any
+     * other output — only in-memory and UI state is reset.</p>
+     */ // CHANGED: Defect #1 — filter field resets added; Defect #2 Javadoc clarification
     private void clearDisplayOnly() {
+        allRawResults.clear();
         tableModel.clear();
         tableModel.fireTableDataChanged();
         resetScoreBox();
@@ -348,10 +410,22 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         testEndField.setText("");
         testDurationField.setText("");
         testStartTime = null;
-        // Restore interactive state in case clear is called mid-test // CHANGED: Feature #4
+        // Restore interactive state in case clear is called mid-test
         testRunning = false;
         filenameField.setEditable(true);
         if (browseButton != null) { browseButton.setEnabled(true); }
+        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — table is empty after clear, so all filter fields disabled
+        // CHANGED: Defect #1 — reset filter fields; guard suppresses applyAllFilters() listeners
+        configuringElement = true;
+        try {
+            startOffsetField.setText("");
+            endOffsetField.setText("");
+            transactionNamesField.setText("");
+            regexCheckBox.setSelected(false);
+            includeExcludeCombo.setSelectedIndex(0); // "Include"
+        } finally {
+            configuringElement = false;
+        }
         if (updateTimer != null && updateTimer.isRunning()) { updateTimer.stop(); }
     }
 
@@ -378,44 +452,29 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
             }
         }
 
-        int startOffset = parseIntSafe(startOffsetField.getText().trim());
-        int endOffset = parseIntSafe(endOffsetField.getText().trim()); // CHANGED: read end offset for filtering
-        String txPattern = transactionNamesField.getText().trim();
-        boolean useRegex = regexCheckBox.isSelected();
-        boolean include = "Include".equals(includeExcludeCombo.getSelectedItem());
-
-        for (BpmResult r : batch) {
-            if (testStartTime != null && (startOffset > 0 || endOffset > 0)) { // CHANGED: check both offsets
-                try {
-                    Instant sampleTime = Instant.parse(r.timestamp());
-                    long elapsedSec = Duration.between(testStartTime, sampleTime).getSeconds();
-                    if (startOffset > 0 && elapsedSec < startOffset) { continue; }
-                    if (endOffset > 0 && elapsedSec > endOffset) { continue; } // CHANGED: skip samples beyond end offset
-                } catch (Exception ignored) { }
-            }
-            if (!txPattern.isEmpty()) {
-                boolean matches = matchesTransaction(r.samplerLabel(), txPattern, useRegex);
-                if (include && !matches) { continue; }
-                if (!include && matches) { continue; }
-            }
-            tableModel.addOrUpdateResult(r);
-        }
+        // CHANGED: Defect #2 — store all incoming records raw; offset filter applied in rebuild,
+        // not at ingest, so changing offset retroactively re-filters the entire dataset.
+        allRawResults.addAll(batch);
+        rebuildTableFromRaw();
 
         updateScoreBox(listener);
-        tableModel.fireTableDataChanged();
-        saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
     }
 
     public void testStarted() {
+        // CHANGED: Defect #2 — clear raw record store and table so new run starts with fresh display
+        allRawResults.clear();
+        tableModel.clear();
+        tableModel.fireTableDataChanged();
         testRunning = true;
         testStartTime = Instant.now();
         testStartField.setText(TIME_FMT.format(testStartTime));
         testEndField.setText("");
         testDurationField.setText("");
-        // Disable file controls during test run // CHANGED: Feature #2
+        // Disable file controls during test run // CHANGED: Feature #2 (prev session)
         filenameField.setEditable(false);
         browseButton.setEnabled(false);
         saveTableDataButton.setEnabled(false);
+        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — replaces explicit startOffsetField.setEnabled(false) / endOffsetField.setEnabled(false)
         if (!updateTimer.isRunning()) { updateTimer.start(); }
     }
 
@@ -432,9 +491,10 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         }
         updateTimer.stop();
         drainGuiQueue();
-        // Re-enable file controls after test ends // CHANGED: Feature #2
+        // Re-enable file controls after test ends // CHANGED: Feature #2 (prev session)
         filenameField.setEditable(true);
         browseButton.setEnabled(true);
+        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — replaces explicit startOffsetField.setEnabled(true) / endOffsetField.setEnabled(true)
         saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
     }
 
@@ -490,21 +550,101 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         scoreCategoryLabel.setText("Good: 0  Needs Work: 0  Poor: 0");
     }
 
-    private void applyTransactionFilter() {
+    /**
+     * Rebuilds the table model from raw records, applying the current offset filter.
+     * The transaction name filter is applied at view time via {@link BpmTableModel#getFilteredRows()}.
+     * Called on every incoming batch and on any filter change for retroactive re-filtering.
+     */ // CHANGED: Defect #2 — replaces ingest-time offset filter; resolves Open Item #3
+    private void rebuildTableFromRaw() {
+        tableModel.clear();
+        int startOffset = parseIntSafe(startOffsetField.getText().trim());
+        int endOffset   = parseIntSafe(endOffsetField.getText().trim());
+        for (BpmResult r : allRawResults) {
+            if (testStartTime != null && (startOffset > 0 || endOffset > 0)) {
+                try {
+                    Instant sampleTime = Instant.parse(r.timestamp());
+                    long elapsedSec = Duration.between(testStartTime, sampleTime).getSeconds();
+                    if (startOffset > 0 && elapsedSec < startOffset) { continue; }
+                    if (endOffset   > 0 && elapsedSec > endOffset)   { continue; }
+                } catch (Exception ignored) { }
+            }
+            tableModel.addOrUpdateResult(r);
+        }
+        tableModel.fireTableDataChanged();
+        saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
+        updateFilterFieldsEnabled(); // CHANGED: Feature #1
+    }
+
+    /**
+     * Unified filter trigger — sets the transaction name filter on the table model and
+     * rebuilds aggregated rows from raw records with the current offset applied.
+     * Called on any filter-field change (offset, transaction name, regex, include/exclude).
+     */ // CHANGED: Feature #2 — replaces applyTransactionFilter(); now covers both offset and tx-name
+    private void applyAllFilters() {
+        if (configuringElement) { return; } // CHANGED: Defect #2 — suppress during programmatic configure()
         tableModel.setTransactionFilter(
                 transactionNamesField.getText().trim(),
                 regexCheckBox.isSelected(),
                 "Include".equals(includeExcludeCombo.getSelectedItem()));
-        tableModel.fireTableDataChanged();
+        rebuildTableFromRaw();
     }
 
-    private static boolean matchesTransaction(String label, String pattern, boolean useRegex) {
-        if (pattern == null || pattern.isEmpty()) { return true; }
-        if (useRegex) {
-            try { return Pattern.compile(pattern).matcher(label).find(); }
-            catch (PatternSyntaxException e) { return label.contains(pattern); }
+    /**
+     * Loads the JSONL file whose path is in the filename field when Enter is pressed.
+     * No-op during a live test or if the path is empty / file does not exist.
+     */ // CHANGED: Feature #3 — Enter key on filename field loads file
+    private void loadFileFromField() {
+        if (testRunning) { return; }
+        String path = filenameField.getText().trim();
+        if (path.isEmpty()) { return; }
+        Path p = Path.of(path);
+        if (Files.exists(p)) {
+            loadJsonlFile(p);
         }
-        return label.contains(pattern);
+    }
+
+    /**
+     * Restricts a text field to positive integer input (digits 0–9 only).
+     * Non-digit characters are silently rejected on every keystroke.
+     */ // CHANGED: Defect #2 — validation matching JAAR's offset field behaviour
+    private static void applyPositiveIntegerFilter(JTextField field) {
+        ((AbstractDocument) field.getDocument()).setDocumentFilter(new DocumentFilter() {
+            @Override
+            public void insertString(FilterBypass fb, int offset, String text, AttributeSet attr)
+                    throws BadLocationException {
+                if (text != null && text.chars().allMatch(Character::isDigit)) {
+                    super.insertString(fb, offset, text, attr);
+                }
+            }
+            @Override
+            public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attr)
+                    throws BadLocationException {
+                if (text != null && text.chars().allMatch(Character::isDigit)) {
+                    super.replace(fb, offset, length, text, attr);
+                }
+            }
+        });
+    }
+
+    /**
+     * Synchronizes the enabled state of all four filter fields to the current row count and
+     * test-running state. Call this whenever either of those two conditions changes.
+     *
+     * <ul>
+     *   <li>Offset fields — enabled only when the table has data <em>and</em> the test is not
+     *       running (offset is meaningless without data and must not be changed mid-run).</li>
+     *   <li>Transaction-names, regex, include/exclude — enabled when the table has data;
+     *       live filtering during a test is permitted.</li>
+     * </ul>
+     */ // CHANGED: Feature #1
+    private void updateFilterFieldsEnabled() {
+        boolean hasRows = tableModel.getRowCount() > 0;
+        boolean offsetEnabled = hasRows && !testRunning;
+        startOffsetField.setEnabled(offsetEnabled);
+        endOffsetField.setEnabled(offsetEnabled);
+        transactionNamesField.setEnabled(hasRows);
+        regexCheckBox.setEnabled(hasRows);
+        includeExcludeCombo.setEnabled(hasRows);
     }
 
     private void applyColumnVisibility() {
@@ -550,14 +690,23 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
     private void loadJsonlFile(Path path) {
         ObjectMapper mapper = new ObjectMapper();
+        // CHANGED: Feature #3 — reset raw store and table before loading a new file
+        allRawResults.clear();
         tableModel.clear();
+        testStartTime = null; // will be set from first record's timestamp below
+
         try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.isBlank()) { continue; }
                 try {
                     BpmResult result = mapper.readValue(line, BpmResult.class);
-                    tableModel.addOrUpdateResult(result);
+                    allRawResults.add(result); // CHANGED: Feature #3 — store raw for retroactive filtering
+                    // Use first record's timestamp as offset reference for loaded files
+                    if (testStartTime == null && result.timestamp() != null) {
+                        try { testStartTime = Instant.parse(result.timestamp()); }
+                        catch (Exception ignored) { }
+                    }
                 } catch (Exception e) {
                     log.warn("BPM: Skipping malformed JSONL line: {}", e.getMessage());
                 }
@@ -566,8 +715,7 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
             log.warn("BPM: Failed to load JSONL file: {}", path, e);
             return;
         }
-        tableModel.fireTableDataChanged();
-        saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
+        rebuildTableFromRaw(); // CHANGED: Feature #3 — applies current filters on loaded data
     }
 
     private void saveTableData() {
@@ -690,6 +838,19 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
             RowData total = new RowData("TOTAL");
             for (RowData row : sourceRows) { total.mergeFrom(row); }
             return total;
+        }
+
+        /**
+         * Returns {@code true} if {@code label} matches {@code pattern} using either regex or
+         * substring matching, depending on {@code useRegex}. An empty or null pattern always matches.
+         */
+        private static boolean matchesTransaction(String label, String pattern, boolean useRegex) { // CHANGED: moved from BpmListenerGui; made static to match static-class context
+            if (pattern == null || pattern.isEmpty()) { return true; }
+            if (useRegex) {
+                try { return Pattern.compile(pattern).matcher(label).find(); }
+                catch (PatternSyntaxException e) { return label.contains(pattern); }
+            }
+            return label.contains(pattern);
         }
     }
 
