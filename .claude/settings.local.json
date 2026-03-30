@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/f/Projects/**)",
+      "Bash(mvn clean:*)"
+    ]
+  }
+}

@@ -15,8 +15,6 @@ import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.*;
 import java.awt.*;
-import java.awt.event.FocusAdapter;
-import java.awt.event.FocusEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import javax.swing.text.AbstractDocument;
@@ -71,6 +69,7 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     private JProgressBar scoreBar;
     private JLabel scoreCategoryLabel;
     private JButton saveTableDataButton;
+    private JButton applyFiltersButton;     // CHANGED: Change #2 — Apply Filters button
     private Timer updateTimer;
 
     private transient BpmListener listenerRef;
@@ -224,20 +223,11 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         includeExcludeCombo = new JComboBox<>(new String[]{"Include", "Exclude"});
         fieldset.add(includeExcludeCombo);
 
-        // CHANGED: Feature #2 — Apply button removed.
-        // All filter fields trigger applyAllFilters() immediately on focus-lost or Enter.
-        // Combo and checkbox trigger on selection/state change.
-        FocusAdapter filterFocus = new FocusAdapter() {
-            @Override public void focusLost(FocusEvent e) { applyAllFilters(); }
-        };
-        startOffsetField.addFocusListener(filterFocus);
-        startOffsetField.addActionListener(e -> applyAllFilters());      // Enter key
-        endOffsetField.addFocusListener(filterFocus);
-        endOffsetField.addActionListener(e -> applyAllFilters());        // Enter key
-        transactionNamesField.addFocusListener(filterFocus);
-        transactionNamesField.addActionListener(e -> applyAllFilters()); // Enter key
-        regexCheckBox.addItemListener(e -> applyAllFilters());
-        includeExcludeCombo.addActionListener(e -> applyAllFilters());
+        // CHANGED: Change #2 — Apply Filters button; no auto-filtering on field change.
+        // All filtering is deferred until the user explicitly clicks Apply Filters.
+        applyFiltersButton = new JButton("Apply Filters");
+        applyFiltersButton.addActionListener(e -> applyAllFilters());
+        fieldset.add(applyFiltersButton);
 
         return fieldset;
     }
@@ -368,8 +358,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                             testRunning = true;
                             updateTimer.start();
                         }
-                    } else if (tableModel.getRowCount() == 0) {
-                        clearDisplayOnly();
+                    } else {
+                        clearDisplayOnly(); // CHANGED: Defect #3 — always clear for a fresh listener with no active test; previous guard (getRowCount() == 0) allowed stale data from a prior file-load to bleed into a newly added listener
                     }
                 }
             }
@@ -437,6 +427,16 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         ConcurrentLinkedQueue<BpmResult> queue = listener.getGuiUpdateQueue();
         if (queue == null) { return; }
 
+        // CHANGED: Feature #1 — update End and Duration continuously every timer tick during live test,
+        // regardless of whether new records arrived. Gives real-time elapsed view without waiting for testEnded().
+        if (testRunning && testStartTime != null) {
+            Instant now = Instant.now();
+            testEndField.setText(TIME_FMT.format(now));
+            Duration elapsed = Duration.between(testStartTime, now);
+            testDurationField.setText(String.format("%dh %dm %ds",
+                    elapsed.toHours(), elapsed.toMinutesPart(), elapsed.toSecondsPart()));
+        }
+
         List<BpmResult> batch = new ArrayList<>();
         BpmResult result;
         while ((result = queue.poll()) != null) { batch.add(result); }
@@ -461,6 +461,7 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     public void testStarted() {
+        if (BpmListener.isDontStartPending()) { return; } // CHANGED: Defect #2 — user chose "Don't Start"; preserve loaded file data
         // CHANGED: Defect #2 — clear raw record store and table so new run starts with fresh display
         allRawResults.clear();
         tableModel.clear();
@@ -479,15 +480,19 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     public void testEnded() {
+        boolean wasRunning = testRunning; // CHANGED: Defect #2 — capture before reset; false when DONT_START (testStarted never set it true)
         testRunning = false;
-        Instant endTime = Instant.now();
-        testEndField.setText(TIME_FMT.format(endTime));
-        if (testStartTime != null) {
-            Duration dur = Duration.between(testStartTime, endTime);
-            long h = dur.toHours();
-            long m = dur.toMinutesPart();
-            long s = dur.toSecondsPart();
-            testDurationField.setText(String.format("%dh %dm %ds", h, m, s));
+        // Only update time fields when the test actually ran; preserves loaded file timestamps on DONT_START
+        if (wasRunning) { // CHANGED: Defect #2
+            Instant endTime = Instant.now();
+            testEndField.setText(TIME_FMT.format(endTime));
+            if (testStartTime != null) {
+                Duration dur = Duration.between(testStartTime, endTime);
+                long h = dur.toHours();
+                long m = dur.toMinutesPart();
+                long s = dur.toSecondsPart();
+                testDurationField.setText(String.format("%dh %dm %ds", h, m, s));
+            }
         }
         updateTimer.stop();
         drainGuiQueue();
@@ -551,6 +556,63 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     /**
+     * Populates (or clears) the Test Time Info fields from the first and last
+     * record timestamps that survived the current offset filter.
+     * Called from {@link #rebuildTableFromRaw()} when not in a live test so that
+     * adjusting Start/End Offset immediately updates the displayed time window.
+     */ // CHANGED: Defect #1
+    private void updateTimeFieldsFromRaw(Instant first, Instant last) {
+        testStartField.setText(first != null ? TIME_FMT.format(first) : "");
+        testEndField.setText(last != null ? TIME_FMT.format(last) : "");
+        if (first != null && last != null) {
+            Duration dur = Duration.between(first, last);
+            testDurationField.setText(String.format("%dh %dm %ds",
+                    dur.toHours(), dur.toMinutesPart(), dur.toSecondsPart()));
+        } else {
+            testDurationField.setText("");
+        }
+    }
+
+    /**
+     * Computes and displays the overall performance score directly from the table model rows.
+     * Used when no live BpmListener is active (file-load mode and post-filter apply).
+     * Mirrors the weighted-average logic in {@link #updateScoreBox(BpmListener)}.
+     */ // CHANGED: Defect #1
+    private void updateScoreBoxFromTable() {
+        int scoreGood = propertiesRef != null ? propertiesRef.getSlaScoreGood() : BpmConstants.DEFAULT_SLA_SCORE_GOOD;
+        int scorePoor = propertiesRef != null ? propertiesRef.getSlaScorePoor() : BpmConstants.DEFAULT_SLA_SCORE_POOR;
+
+        long totalWeightedScore = 0;
+        int totalScoredSamples = 0;
+        int goodCount = 0, needsWorkCount = 0, poorCount = 0;
+
+        for (RowData row : tableModel.getFilteredRows()) {
+            if ("TOTAL".equals(row.label)) { continue; }
+            if (row.scoredSampleCount > 0) {
+                int score = (int) (row.totalScore / row.scoredSampleCount);
+                totalWeightedScore += (long) score * row.scoredSampleCount;
+                totalScoredSamples += row.scoredSampleCount;
+                if (score >= scoreGood)      { goodCount++; }
+                else if (score >= scorePoor) { needsWorkCount++; }
+                else                         { poorCount++; }
+            }
+        }
+
+        if (totalScoredSamples > 0) {
+            int overallScore = (int) (totalWeightedScore / totalScoredSamples);
+            scoreLabel.setText(String.valueOf(overallScore));
+            scoreBar.setValue(overallScore);
+            scoreBar.setString(String.valueOf(overallScore));
+            scoreBar.setForeground(overallScore >= scoreGood ? COLOR_GOOD
+                    : overallScore >= scorePoor ? COLOR_NEEDS_WORK : COLOR_POOR);
+        } else {
+            resetScoreBox();
+        }
+        scoreCategoryLabel.setText(String.format("Good: %d  Needs Work: %d  Poor: %d",
+                goodCount, needsWorkCount, poorCount));
+    }
+
+    /**
      * Rebuilds the table model from raw records, applying the current offset filter.
      * The transaction name filter is applied at view time via {@link BpmTableModel#getFilteredRows()}.
      * Called on every incoming batch and on any filter change for retroactive re-filtering.
@@ -559,20 +621,39 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         tableModel.clear();
         int startOffset = parseIntSafe(startOffsetField.getText().trim());
         int endOffset   = parseIntSafe(endOffsetField.getText().trim());
+        Instant firstFiltered = null; // CHANGED: Defect #1 — track first/last record that survives offset filter
+        Instant lastFiltered  = null;
         for (BpmResult r : allRawResults) {
-            if (testStartTime != null && (startOffset > 0 || endOffset > 0)) {
-                try {
-                    Instant sampleTime = Instant.parse(r.timestamp());
-                    long elapsedSec = Duration.between(testStartTime, sampleTime).getSeconds();
-                    if (startOffset > 0 && elapsedSec < startOffset) { continue; }
-                    if (endOffset   > 0 && elapsedSec > endOffset)   { continue; }
-                } catch (Exception ignored) { }
+            Instant sampleTime = null;
+            if (r.timestamp() != null) {
+                try { sampleTime = Instant.parse(r.timestamp()); } catch (Exception ignored) { }
+            }
+            if (testStartTime != null && (startOffset > 0 || endOffset > 0) && sampleTime != null) {
+                long elapsedSec = Duration.between(testStartTime, sampleTime).getSeconds();
+                if (startOffset > 0 && elapsedSec < startOffset) { continue; }
+                if (endOffset   > 0 && elapsedSec > endOffset)   { continue; }
+            }
+            // Record passes filter — track first/last timestamps unconditionally for Test Time Info
+            if (sampleTime != null) { // CHANGED: Defect #1 — track regardless of testRunning so live-test Start offset update works
+                if (firstFiltered == null) { firstFiltered = sampleTime; }
+                lastFiltered = sampleTime;
             }
             tableModel.addOrUpdateResult(r);
         }
         tableModel.fireTableDataChanged();
         saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
         updateFilterFieldsEnabled(); // CHANGED: Feature #1
+        if (testRunning) {
+            // CHANGED: Defect #1 — when start offset is active during live test, update Start
+            // to reflect the first record that entered the window; End/Duration are handled
+            // by the continuous timer update in drainGuiQueue() so only Start is touched here.
+            if (firstFiltered != null && parseIntSafe(startOffsetField.getText().trim()) > 0) {
+                testStartField.setText(TIME_FMT.format(firstFiltered));
+            }
+        } else {
+            updateTimeFieldsFromRaw(firstFiltered, lastFiltered); // CHANGED: Defect #1
+            updateScoreBoxFromTable();
+        }
     }
 
     /**
@@ -627,24 +708,22 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     /**
-     * Synchronizes the enabled state of all four filter fields to the current row count and
-     * test-running state. Call this whenever either of those two conditions changes.
+     * Synchronizes the enabled state of filter fields to the current row count.
+     * Call this whenever either the row count or test-running state changes.
      *
      * <ul>
-     *   <li>Offset fields — enabled only when the table has data <em>and</em> the test is not
-     *       running (offset is meaningless without data and must not be changed mid-run).</li>
-     *   <li>Transaction-names, regex, include/exclude — enabled when the table has data;
-     *       live filtering during a test is permitted.</li>
+     *   <li>Offset fields and Apply Filters — always enabled (Change #1, Change #2).</li>
+     *   <li>Transaction-names, regex, include/exclude — enabled when the table has data.</li>
      * </ul>
-     */ // CHANGED: Feature #1
+     */ // CHANGED: Feature #1; Change #1; Change #2
     private void updateFilterFieldsEnabled() {
         boolean hasRows = tableModel.getRowCount() > 0;
-        boolean offsetEnabled = hasRows && !testRunning;
-        startOffsetField.setEnabled(offsetEnabled);
-        endOffsetField.setEnabled(offsetEnabled);
+        startOffsetField.setEnabled(true);  // CHANGED: Change #1 — always enabled irrespective of data or test state
+        endOffsetField.setEnabled(true);    // CHANGED: Change #1 — always enabled irrespective of data or test state
         transactionNamesField.setEnabled(hasRows);
         regexCheckBox.setEnabled(hasRows);
         includeExcludeCombo.setEnabled(hasRows);
+        if (applyFiltersButton != null) { applyFiltersButton.setEnabled(true); } // CHANGED: Change #2 — always enabled
     }
 
     private void applyColumnVisibility() {
@@ -693,7 +772,12 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         // CHANGED: Feature #3 — reset raw store and table before loading a new file
         allRawResults.clear();
         tableModel.clear();
-        testStartTime = null; // will be set from first record's timestamp below
+        testStartTime = null;
+        // Clear display immediately; rebuildTableFromRaw() will repopulate from filtered records
+        testStartField.setText("");
+        testEndField.setText("");
+        testDurationField.setText("");
+        resetScoreBox();
 
         try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
             String line;
@@ -702,10 +786,9 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                 try {
                     BpmResult result = mapper.readValue(line, BpmResult.class);
                     allRawResults.add(result); // CHANGED: Feature #3 — store raw for retroactive filtering
-                    // Use first record's timestamp as offset reference for loaded files
+                    // testStartTime is the offset reference point — always the absolute first record's timestamp
                     if (testStartTime == null && result.timestamp() != null) {
-                        try { testStartTime = Instant.parse(result.timestamp()); }
-                        catch (Exception ignored) { }
+                        try { testStartTime = Instant.parse(result.timestamp()); } catch (Exception ignored) { }
                     }
                 } catch (Exception e) {
                     log.warn("BPM: Skipping malformed JSONL line: {}", e.getMessage());
@@ -715,7 +798,10 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
             log.warn("BPM: Failed to load JSONL file: {}", path, e);
             return;
         }
-        rebuildTableFromRaw(); // CHANGED: Feature #3 — applies current filters on loaded data
+
+        // CHANGED: Defect #1 — time fields and score are populated inside rebuildTableFromRaw()
+        // using first/last timestamps of records that survive the current offset filter.
+        rebuildTableFromRaw();
     }
 
     private void saveTableData() {

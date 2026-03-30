@@ -74,6 +74,28 @@ public class BpmListener extends AbstractTestElement
     private static volatile BpmListener activeInstance;
 
     /**
+     * Set to {@code true} when the user chooses "Don't Start" in the file-exists dialog.
+     * Blocks all subsequent clone {@link #testStarted} calls in the same cancelled test run
+     * and suppresses the GUI clear in {@link BpmListenerGui#testStarted()}.
+     * Cleared only on a successful test start (just before {@code activeInstance = this})
+     * or in {@link #testEnded(String)} after the engine stops.
+     */ // CHANGED: Defect #2
+    private static volatile boolean dontStartPending = false;
+
+    /** Returns true if "Don't Start" was chosen and the engine stop is in progress. */ // CHANGED: Defect #2
+    public static boolean isDontStartPending() { return dontStartPending; }
+
+    /**
+     * True only when this instance completed a full {@link #testStarted(String)} (i.e. the test
+     * actually started). False for DONT_START returns and for clones that never ran testStarted.
+     * Guards {@link #testEnded(String)} so only the owner instance notifies the GUI.
+     */ // CHANGED: Defect #2
+    private transient boolean testActuallyStarted = false;
+
+    /** Engine reference cached at the very start of testStarted() for use in stopTestEngine(). */ // CHANGED: Defect #2
+    private transient org.apache.jmeter.engine.JMeterEngine cachedEngine;
+
+    /**
      * Returns the currently active (initialized) BpmListener instance, or null
      * if no test is running. Used by BpmListenerGui to drain the correct queue.
      */
@@ -139,6 +161,20 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testStarted(String host) {
+        // CHANGED: Defect #2 — if another BpmListener in this test run already chose DONT_START,
+        // skip all processing on clones so they don't proceed past the cancelled decision.
+        if (dontStartPending) { return; }
+
+        testActuallyStarted = false; // CHANGED: Defect #2 — reset; set true only at successful test start
+
+        // Cache engine reference NOW — called on the engine thread where context is guaranteed to
+        // have the engine set. After invokeAndWait (dialog) we may be resuming on the same thread
+        // but caching up-front is safer and avoids any ThreadLocal surprises.
+        cachedEngine = null; // CHANGED: Defect #2
+        try {
+            cachedEngine = org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
+        } catch (Exception ignored) {}
+
         // Load configuration
         propertiesManager = new BpmPropertiesManager();
         propertiesManager.load();
@@ -174,7 +210,8 @@ public class BpmListener extends AbstractTestElement
                     FileOpenMode mode = resolveFileOpenMode(outputFile);
                     if (mode == FileOpenMode.DONT_START) {
                         log.info("BPM: Test cancelled — output file conflict: {}", outputFile);
-                        stopTestEngine();
+                        dontStartPending = true; // CHANGED: Defect #2 — signal GUI to preserve loaded data; also blocks clones
+                        stopTestEngine(cachedEngine); // CHANGED: Defect #2 — pass cached ref obtained before dialog
                         return;
                     }
                     append = (mode == FileOpenMode.APPEND);
@@ -220,6 +257,8 @@ public class BpmListener extends AbstractTestElement
             // Non-GUI mode — no GUI to notify
         }
 
+        dontStartPending = false;   // CHANGED: Defect #2 — clear flag; test is actually starting now
+        testActuallyStarted = true; // CHANGED: Defect #2 — mark this instance as fully started
         activeInstance = this; // CHANGED: register as the active instance for clone delegation
     }
 
@@ -332,6 +371,16 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testEnded(String host) {
+        // CHANGED: Defect #2 — always clear flag on test end so the next run starts clean
+        dontStartPending = false;
+
+        // CHANGED: Defect #2 — if this instance never fully started (DONT_START or clone),
+        // skip all cleanup and GUI notification to preserve the displayed file data
+        if (!testActuallyStarted) {
+            log.debug("BPM: testEnded() on instance that never fully started — skipping.");
+            return;
+        }
+
         try {
             // Flush and close JSONL
             if (jsonlWriter != null) {
@@ -535,18 +584,42 @@ public class BpmListener extends AbstractTestElement
     }
 
     /**
-     * Requests a graceful test stop via the JMeter engine.
-     * Silently no-ops if the engine reference is unavailable.
-     */ // CHANGED: Feature #3
-    private void stopTestEngine() {
+     * Requests an immediate test stop via the JMeter engine.
+     * Uses the engine reference cached at the top of {@link #testStarted(String)} (obtained on
+     * the engine thread before the dialog blocked it). Falls back to the GUI ActionRouter so that
+     * even if the context reference is unavailable the test can still be stopped.
+     *
+     * @param engine the cached engine reference; may be null, in which case only the ActionRouter
+     *               fallback is attempted
+     */ // CHANGED: Defect #2 — accepts pre-cached engine; adds ActionRouter fallback
+    private void stopTestEngine(org.apache.jmeter.engine.JMeterEngine engine) {
+        // Primary: stop via cached engine reference (synchronous — prevents threads from starting)
+        if (engine != null) {
+            try {
+                engine.stopTest(true);
+                log.info("BPM: Test engine stop requested (immediate).");
+            } catch (Exception e) {
+                log.warn("BPM: engine.stopTest(true) failed: {}", e.getMessage());
+            }
+        } else {
+            log.warn("BPM: Cached engine reference is null — relying on ActionRouter fallback.");
+        }
+        // Fallback: GUI ActionRouter (equivalent to pressing Stop in JMeter UI)
         try {
-            org.apache.jmeter.engine.JMeterEngine engine =
-                    org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
-            if (engine != null) {
-                engine.stopTest(false); // graceful — let current samplers finish
+            if (org.apache.jmeter.gui.GuiPackage.getInstance() != null) {
+                javax.swing.SwingUtilities.invokeLater(() -> {
+                    try {
+                        org.apache.jmeter.gui.action.ActionRouter.getInstance()
+                                .doActionNow(new java.awt.event.ActionEvent(
+                                        this, java.awt.event.ActionEvent.ACTION_PERFORMED, "stop"));
+                        log.info("BPM: Test stop action sent via ActionRouter.");
+                    } catch (Exception e) {
+                        log.warn("BPM: ActionRouter stop failed: {}", e.getMessage());
+                    }
+                });
             }
         } catch (Exception e) {
-            log.warn("BPM: Could not stop test engine: {}", e.getMessage());
+            log.warn("BPM: Could not access ActionRouter: {}", e.getMessage());
         }
     }
 
