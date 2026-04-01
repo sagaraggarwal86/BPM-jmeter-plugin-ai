@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -75,15 +76,36 @@ public class BpmListener extends AbstractTestElement
     // CHANGED: Static reference to the instance that received testStarted() — cloned instances
     // that receive sampleOccurred() without testStarted() delegate to this active instance.
     private static volatile BpmListener activeInstance;
+    /**
+     * All active JSONL writers across all primaries. The primary that collects metrics writes
+     * the BpmResult to EVERY registered writer, so all output files contain the same data.
+     * This is necessary because only the first primary to encounter a thread opens the CDP
+     * session and populates its own executorsByThread — other primaries' maps remain empty.
+     */
+    private static final java.util.concurrent.CopyOnWriteArrayList<JsonlWriter> allJsonlWriters =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+    /**
+     * All active GUI update queues across all primaries. Results are broadcast to all queues
+     * so every BpmListenerGui instance shows the same live data regardless of which primary
+     * performed the actual metric collection.
+     */
+    private static final java.util.concurrent.CopyOnWriteArrayList<ConcurrentLinkedQueue<BpmResult>> allGuiQueues =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
 
     /**
-     * Set to {@code true} when the user chooses "Don't Start" in the file-exists dialog.
-     * Blocks all subsequent clone {@link #testStarted} calls in the same cancelled test run
-     * and suppresses the GUI clear in {@link BpmListenerGui#testStarted()}.
-     * Cleared only on a successful test start (just before {@code activeInstance = this})
-     * or in {@link #testEnded(String)} after the engine stops.
-     */ // CHANGED: Defect #2
-    private static volatile boolean dontStartPending = false;
+     * Pre-flight coordination: ensures the file-exists scan runs exactly once per test run.
+     * The first BpmListener primary to call testStarted() wins the CAS and performs the scan
+     * across ALL enabled BpmListener elements. Subsequent primaries read {@link #globalFileDecision}.
+     * Reset in testEnded() when the last primary cleans up.
+     */
+    private static final AtomicBoolean preFlightDone = new AtomicBoolean(false);
+    /**
+     * Global file-exists decision, set by the pre-flight scan.
+     * {@code OVERWRITE} = proceed (no conflicts or user chose Overwrite).
+     * {@code DONT_START} = user chose "Don't Start JMeter Engine" — all listeners skip setup.
+     * {@code null} = pre-flight has not run yet.
+     */
+    private static volatile FileOpenMode globalFileDecision;
     /**
      * True only when this instance completed a full {@link #testStarted(String)} (i.e. the test
      * actually started). False for DONT_START returns and for clones that never ran testStarted.
@@ -131,18 +153,58 @@ public class BpmListener extends AbstractTestElement
     private transient ConcurrentHashMap<String, AtomicInteger> iterationsByThread;
 
     /**
-     * Returns true if "Don't Start" was chosen and the engine stop is in progress.
-     */ // CHANGED: Defect #2
+     * Returns true if the pre-flight scan resolved to DONT_START — the user chose
+     * "Don't Start JMeter Engine" in the file-exists dialog. Used by the GUI to
+     * suppress testStarted clear when the test was cancelled before starting.
+     */
     public static boolean isDontStartPending() {
-        return dontStartPending;
+        return globalFileDecision == FileOpenMode.DONT_START;
     }
 
     /**
      * Returns the currently active (initialized) BpmListener instance, or null
-     * if no test is running. Used by BpmListenerGui to drain the correct queue.
+     * if no test is running.
+     * @deprecated Use {@link #getPrimaryForElement(String)} for per-element lookup.
      */
     public static BpmListener getActiveInstance() {
         return activeInstance;
+    }
+
+    /**
+     * Returns the primary (initialized) BpmListener for the given element key,
+     * or null if no primary is registered. The key is a composite of UUID + "|" + output path.
+     * This is the per-element equivalent of {@link #getActiveInstance()}.
+     */
+    public static BpmListener getPrimaryForElement(String elementKey) {
+        if (elementKey == null || elementKey.isEmpty()) return null;
+        return primaryByName.get(elementKey);
+    }
+
+    /**
+     * Builds the composite element key from a TestElement's properties.
+     * Used by the GUI to look up the primary for a given element.
+     */
+    public static String buildElementKey(org.apache.jmeter.testelement.TestElement element) {
+        String elementId = element.getPropertyAsString(BpmConstants.TEST_ELEMENT_ID, "").trim();
+        if (elementId.isEmpty()) {
+            elementId = element.getName();
+        }
+        String outputPath = element.getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "").trim();
+        return elementId + "|" + outputPath;
+    }
+
+    /**
+     * Returns true if any BpmListener primary is currently running.
+     */
+    public static boolean isAnyTestRunning() {
+        return !primaryByName.isEmpty();
+    }
+
+    /**
+     * Instance convenience method — delegates to {@link #buildElementKey(TestElement)}.
+     */
+    private String buildElementKey() {
+        return buildElementKey(this);
     }
 
     /**
@@ -168,41 +230,65 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testStarted(String host) {
-        // CHANGED: Defect #2 — if another BpmListener in this test run already chose DONT_START,
-        // skip all processing on clones so they don't proceed past the cancelled decision.
-        if (dontStartPending) {
+        // Build composite key: UUID + output path. This ensures copied elements (same UUID,
+        // different output paths) are treated as distinct, while thread-group clones (same
+        // UUID AND same path) correctly share the primary slot.
+        String elementKey = buildElementKey();
+
+        // If the global pre-flight already decided DONT_START, skip everything.
+        if (globalFileDecision == FileOpenMode.DONT_START) {
             return;
         }
-        // CHANGED: Defect — per-element UUID key replaces getName().
-        // Multiple distinct listeners often share the same default name; UUID (stamped at
-        // createTestElement time) is unique per element and inherited by clones, so:
-        //   • First call for a UUID → putIfAbsent returns null → this instance is primary
-        //   • Clone calls with same UUID → putIfAbsent returns existing entry → skip
-        // Fall back to getName() for elements loaded from old .jmx files without a UUID.
-        String elementId = getPropertyAsString(BpmConstants.TEST_ELEMENT_ID, "").trim();
-        if (elementId.isEmpty()) {
-            elementId = getName();
-        }
-        if (primaryByName.putIfAbsent(elementId, this) != null) {
-            log.debug("BPM: testStarted() — clone instance skipped for element id '{}'", elementId);
+        // Per-element primary: first call for a key wins; clones skip.
+        if (primaryByName.putIfAbsent(elementKey, this) != null) {
+            log.debug("BPM: testStarted() — clone instance skipped for key '{}'", elementKey);
             return;
         }
-        log.debug("BPM: testStarted() — this instance is primary for element id '{}'", elementId);
+        log.debug("BPM: testStarted() — this instance is primary for key '{}'", elementKey);
 
-        testActuallyStarted = false; // CHANGED: Defect #2 — reset; set true only at successful test start
+        testActuallyStarted = false;
 
-        // Cache engine reference NOW — called on the engine thread where context is guaranteed to
-        // have the engine set. After invokeAndWait (dialog) we may be resuming on the same thread
-        // but caching up-front is safer and avoids any ThreadLocal surprises.
-        cachedEngine = null; // CHANGED: Defect #2
-        try {
-            cachedEngine = org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
-        } catch (Exception ignored) {
+        // Cache engine reference early — before any blocking dialog.
+        cachedEngine = org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
+
+        // ── Pre-flight file-exists scan (runs exactly once per test run) ──────────────
+        // The first primary to win the CAS scans ALL enabled BpmListener elements in the
+        // test plan. If any user-provided output file exists, a single dialog is shown.
+        // The decision is stored in globalFileDecision for all subsequent primaries.
+        if (preFlightDone.compareAndSet(false, true)) {
+            // Need propertiesManager for -J flag check during scan
+            propertiesManager = new BpmPropertiesManager();
+            propertiesManager.load();
+
+            java.util.List<Path> conflicts = scanForConflictingFiles();
+            if (!conflicts.isEmpty()) {
+                FileOpenMode mode = resolveFileOpenMode(conflicts);
+                globalFileDecision = mode;
+                if (mode == FileOpenMode.DONT_START) {
+                    log.info("BPM: User chose 'Don't Start' — {} conflicting file(s). "
+                            + "Engine will be stopped.", conflicts.size());
+                    primaryByName.remove(elementKey);
+                    stopTestEngine(cachedEngine);
+                    return;
+                }
+                // OVERWRITE: fall through to normal setup
+            } else {
+                globalFileDecision = FileOpenMode.OVERWRITE;
+            }
         }
 
-        // Load configuration
-        propertiesManager = new BpmPropertiesManager();
-        propertiesManager.load();
+        // If another primary's pre-flight resolved to DONT_START while we waited
+        if (globalFileDecision == FileOpenMode.DONT_START) {
+            primaryByName.remove(elementKey);
+            return;
+        }
+
+        // Load configuration (first primary already loaded propertiesManager above;
+        // subsequent primaries load their own copy)
+        if (propertiesManager == null) {
+            propertiesManager = new BpmPropertiesManager();
+            propertiesManager.load();
+        }
 
         debugLogger = new BpmDebugLogger(propertiesManager.isDebugEnabled());
         logOnceTracker = new LogOnceTracker();
@@ -212,37 +298,19 @@ public class BpmListener extends AbstractTestElement
 
         // Initialize collectors
         webVitalsCollector = new WebVitalsCollector();
-        webVitalsCollector.reset(); // CHANGED: §3.5 — explicit reset guards against future singleton reuse
+        webVitalsCollector.reset();
         networkCollector = new NetworkCollector(propertiesManager.getNetworkTopN());
         runtimeCollector = new RuntimeCollector();
-        runtimeCollector.reset(); // CHANGED: per-action accuracy — clears per-thread layout/styleRecalc baselines
+        runtimeCollector.reset();
         consoleCollector = new ConsoleCollector(consoleSanitizer);
         derivedCalculator = new DerivedMetricsCalculator(propertiesManager);
 
         // Initialize writers
         jsonlWriter = new JsonlWriter();
-        // summaryJsonWriter not initialized — Feature #1: summary JSON generation disabled
 
         String outputPath = resolveOutputPath();
         try {
             Path outputFile = Path.of(outputPath);
-            // CHANGED: Feature #3 (this session) — APPEND removed; only Overwrite / Don't Start
-            if (Files.exists(outputFile)) {
-                // Only show the dialog when the path was explicitly provided by the user.
-                // Default-path files are always silently overwritten — no dialog.
-                if (isUserProvidedOutputPath()) {
-                    FileOpenMode mode = resolveFileOpenMode(outputFile);
-                    if (mode == FileOpenMode.DONT_START) {
-                        log.info("BPM: Test cancelled — output file conflict: {}", outputFile);
-                        dontStartPending = true;
-                        stopTestEngine(cachedEngine);
-                        return;
-                    }
-                    // mode == OVERWRITE: fall through to open below
-                } else {
-                    log.info("BPM: Default output file exists — overwriting: {}", outputFile);
-                }
-            }
             jsonlWriter.open(outputFile); // always overwrite (TRUNCATE_EXISTING)
             log.info("BPM: JSONL output file opened (overwrite): {}", outputPath);
         } catch (IOException e) {
@@ -256,6 +324,13 @@ public class BpmListener extends AbstractTestElement
         labelAggregates = new ConcurrentHashMap<>();
         iterationsByThread = new ConcurrentHashMap<>();
 
+        // Register this primary's writer and GUI queue for broadcast writes.
+        // The primary that actually collects metrics writes to ALL registered writers/queues.
+        if (jsonlWriter != null) {
+            allJsonlWriters.add(jsonlWriter);
+        }
+        allGuiQueues.add(guiUpdateQueue);
+
         // Health counters
         samplesCollected = new AtomicInteger(0);
         totalCollectionTimeMs = new AtomicLong(0);
@@ -263,27 +338,22 @@ public class BpmListener extends AbstractTestElement
         // Selenium check deferred to first sampleOccurred
         seleniumAvailable = false;
         seleniumChecked = false;
-        infoBarOverride = null; // CHANGED: §5.7 — reset override on each test start
+        infoBarOverride = null;
 
         debugLogger.log("Test started. Debug mode: {}", propertiesManager.isDebugEnabled());
 
-        // Notify GUI of test start if running in GUI mode // CHANGED: §5.5
+        // Notify GUI of test start if running in GUI mode.
         try {
-            if (org.apache.jmeter.gui.GuiPackage.getInstance() != null) {
-                javax.swing.SwingUtilities.invokeLater(() -> {
-                    var guiComp = org.apache.jmeter.gui.GuiPackage.getInstance().getGui(this);
-                    if (guiComp instanceof BpmListenerGui bpmGui) {
-                        bpmGui.testStarted();
-                    }
-                });
+            BpmListenerGui gui = BpmListenerGui.getActiveGui();
+            if (gui != null) {
+                javax.swing.SwingUtilities.invokeLater(gui::testStarted);
             }
         } catch (Exception ignored) {
             // Non-GUI mode — no GUI to notify
         }
 
-        dontStartPending = false;   // CHANGED: Defect #2 — clear flag; test is actually starting now
-        testActuallyStarted = true; // CHANGED: Defect #2 — mark this instance as fully started
-        activeInstance = this; // CHANGED: register as the active instance for clone delegation
+        testActuallyStarted = true;
+        activeInstance = this;
     }
 
     // ── SampleListener ─────────────────────────────────────────────────────────────────────
@@ -305,11 +375,8 @@ public class BpmListener extends AbstractTestElement
         // The clone forwards the event to the primary instance that owns the writers, collectors,
         // and GUI-connected queue for this specific element name.
         if (errorHandler == null) {
-            String elementId = getPropertyAsString(BpmConstants.TEST_ELEMENT_ID, "").trim();
-            if (elementId.isEmpty()) {
-                elementId = getName();
-            }
-            BpmListener primary = primaryByName.get(elementId);
+            String elementKey = buildElementKey();
+            BpmListener primary = primaryByName.get(elementKey);
             if (primary != null && primary != this) {
                 primary.sampleOccurred(event);
             }
@@ -403,20 +470,29 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testEnded(String host) {
-        // CHANGED: Defect — remove this element's entry so the next run gets a fresh slot
-        String elementId = getPropertyAsString(BpmConstants.TEST_ELEMENT_ID, "").trim();
-        if (elementId.isEmpty()) {
-            elementId = getName();
-        }
-        primaryByName.remove(elementId);
-        // CHANGED: Defect #2 — always clear flag on test end so the next run starts clean
-        dontStartPending = false;
+        // Remove this element's entry so the next run gets a fresh slot
+        String elementKey = buildElementKey();
+        primaryByName.remove(elementKey);
 
-        // CHANGED: Defect #2 — if this instance never fully started (DONT_START or clone),
+        // Reset pre-flight state when the last primary exits, so the next run starts fresh.
+        if (primaryByName.isEmpty()) {
+            preFlightDone.set(false);
+            globalFileDecision = null;
+        }
+
+        // If this instance never fully started (DONT_START or clone),
         // skip all cleanup and GUI notification to preserve the displayed file data
         if (!testActuallyStarted) {
             log.debug("BPM: testEnded() on instance that never fully started — skipping.");
             return;
+        }
+
+        // Deregister this primary's writer and queue from the broadcast lists.
+        if (jsonlWriter != null) {
+            allJsonlWriters.remove(jsonlWriter);
+        }
+        if (guiUpdateQueue != null) {
+            allGuiQueues.remove(guiUpdateQueue);
         }
 
         try {
@@ -447,15 +523,11 @@ public class BpmListener extends AbstractTestElement
                     samplesCollected != null ? samplesCollected.get() : 0);
         }
 
-        // Notify GUI of test end if running in GUI mode // CHANGED: §5.5
+        // Notify GUI of test end if running in GUI mode.
         try {
-            if (org.apache.jmeter.gui.GuiPackage.getInstance() != null) {
-                javax.swing.SwingUtilities.invokeLater(() -> {
-                    var guiComp = org.apache.jmeter.gui.GuiPackage.getInstance().getGui(this);
-                    if (guiComp instanceof BpmListenerGui bpmGui) {
-                        bpmGui.testEnded();
-                    }
-                });
+            BpmListenerGui gui = BpmListenerGui.getActiveGui();
+            if (gui != null) {
+                javax.swing.SwingUtilities.invokeLater(gui::testEnded);
             }
         } catch (Exception ignored) {
             // Non-GUI mode — no GUI to notify
@@ -533,24 +605,6 @@ public class BpmListener extends AbstractTestElement
     // ── Internal: Output path resolution ──────────────────────────────────────────────────
 
     /**
-     * Returns {@code true} when the JSONL output path was explicitly set by the user — either
-     * via the {@code -Jbpm.output} CLI flag or via the GUI filename field. Returns {@code false}
-     * when the path is the bpm.properties/default fallback.
-     *
-     * <p>Used by {@link #testStarted(String)} to decide whether a file-exists dialog should be
-     * shown. Default-path files are always silently overwritten; only user-provided paths trigger
-     * the Append/Overwrite/Don't-Start dialog.</p>
-     */ // CHANGED: Feature #2
-    private boolean isUserProvidedOutputPath() {
-        String jFlag = propertiesManager.getJMeterProperty("bpm.output");
-        if (jFlag != null && !jFlag.isBlank()) {
-            return true;
-        }
-        String guiPath = getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "").trim();
-        return !guiPath.isEmpty();
-    }
-
-    /**
      * Resolves the effective JSONL output file path, applying priority:
      * {@code -Jbpm.output (highest) → GUI TestElement property → bpm.properties/default (lowest)}.
      */
@@ -570,36 +624,92 @@ public class BpmListener extends AbstractTestElement
     }
 
     /**
-     * Determines how to handle an existing JSONL output file.
+     * Scans all enabled BpmListener elements in the test plan for existing output files.
+     * In GUI mode, traverses the test plan tree via {@code GuiPackage}. In CLI mode, returns
+     * an empty list (CLI always overwrites silently).
      *
-     * <p>In CLI mode (no GuiPackage): always overwrites silently — no dialog available.</p>
-     * <p>In GUI mode: blocks the calling thread via {@code SwingUtilities.invokeAndWait}
-     * to show a modal JOptionPane with two choices: Overwrite or Don't Start.
-     * Returns {@link FileOpenMode#DONT_START} if the dialog is dismissed without a selection.</p>
+     * <p>Also checks the {@code -Jbpm.output} flag — if set, it overrides all per-element paths
+     * and only that single path is checked.</p>
      *
-     * @param outputFile the file that already exists on disk
+     * @return list of existing output file paths (user-provided only); empty if no conflicts
+     */
+    private java.util.List<Path> scanForConflictingFiles() {
+        java.util.List<Path> conflicts = new java.util.ArrayList<>();
+
+        // Check -J flag first (applies globally, overrides all per-element paths)
+        String jFlag = propertiesManager.getJMeterProperty("bpm.output");
+        if (jFlag != null && !jFlag.isBlank()) {
+            Path p = Path.of(jFlag);
+            if (Files.exists(p)) {
+                conflicts.add(p);
+            }
+            return conflicts; // -J overrides all per-element paths — no need to scan further
+        }
+
+        // GUI mode: scan all enabled BpmListener elements in the test plan
+        try {
+            org.apache.jmeter.gui.GuiPackage guiPackage = org.apache.jmeter.gui.GuiPackage.getInstance();
+            if (guiPackage == null) {
+                return conflicts; // CLI mode — always overwrite silently
+            }
+
+            var treeModel = guiPackage.getTreeModel();
+            java.util.List<org.apache.jmeter.gui.tree.JMeterTreeNode> nodes =
+                    treeModel.getNodesOfType(BpmListener.class);
+
+            for (org.apache.jmeter.gui.tree.JMeterTreeNode node : nodes) {
+                if (!node.isEnabled()) continue;
+                org.apache.jmeter.testelement.TestElement element = node.getTestElement();
+                String guiPath = element.getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "").trim();
+                if (guiPath.isEmpty()) continue; // default path — not user-provided, skip
+                Path p = Path.of(guiPath);
+                if (Files.exists(p) && !conflicts.contains(p)) {
+                    conflicts.add(p);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("BPM: Failed to scan test plan for output files: {}", e.getMessage());
+        }
+
+        return conflicts;
+    }
+
+    /**
+     * Shows a single dialog listing all conflicting output files and asks the user
+     * whether to overwrite all or stop the engine.
+     *
+     * <p>In CLI mode (no GuiPackage): always returns {@link FileOpenMode#OVERWRITE}.</p>
+     * <p>In GUI mode: blocks via {@code SwingUtilities.invokeAndWait} until the user responds.</p>
+     *
+     * @param conflictingFiles list of existing output files (must not be empty)
      * @return the chosen open mode; never null
-     */ // CHANGED: Feature #3; CHANGED: Feature #3 (this session) — removed Append option
-    private FileOpenMode resolveFileOpenMode(Path outputFile) {
+     */
+    private FileOpenMode resolveFileOpenMode(java.util.List<Path> conflictingFiles) {
         try {
             if (org.apache.jmeter.gui.GuiPackage.getInstance() == null) {
-                // CLI mode — overwrite silently; no interactive dialog available
-                log.info("BPM: Output file exists — overwriting (CLI mode): {}", outputFile);
+                log.info("BPM: {} output file(s) exist — overwriting (CLI mode)", conflictingFiles.size());
                 return FileOpenMode.OVERWRITE;
             }
         } catch (Exception e) {
             return FileOpenMode.OVERWRITE;
         }
 
+        // Build the file list for the dialog message
+        StringBuilder fileList = new StringBuilder();
+        for (Path p : conflictingFiles) {
+            fileList.append("  \u2022 ").append(p).append("\n");
+        }
+
         // GUI mode — ask the user on the EDT, block until answered
-        // Options: index 0 = Overwrite, index 1 / close = Don't Start
         int[] choice = {JOptionPane.CLOSED_OPTION};
         try {
-            String[] options = {"Overwrite", "Don't Start"}; // CHANGED: Feature #3 — Append removed
+            String[] options = {"Overwrite", "Don't Start JMeter Engine"};
+            String message = "BPM output file(s) already exist:\n\n"
+                    + fileList
+                    + "\nWhat would you like to do?";
             Runnable showDialog = () -> choice[0] = JOptionPane.showOptionDialog(
                     null,
-                    "Output file already exists:\n" + outputFile
-                            + "\n\nWhat would you like to do?",
+                    message,
                     "BPM — Output File Exists",
                     JOptionPane.DEFAULT_OPTION,
                     JOptionPane.QUESTION_MESSAGE,
@@ -616,7 +726,7 @@ public class BpmListener extends AbstractTestElement
         }
 
         return switch (choice[0]) {
-            case 0 -> FileOpenMode.OVERWRITE;  // CHANGED: Feature #3 — index 0 is now Overwrite
+            case 0 -> FileOpenMode.OVERWRITE;
             default -> FileOpenMode.DONT_START;
         };
     }
@@ -832,16 +942,18 @@ public class BpmListener extends AbstractTestElement
                     derived
             );
 
-            // Write to JSONL — write() logs WARN internally when writer is not open (Defect #2)
-            if (jsonlWriter != null) { // CHANGED: Defect #2 — removed isOpen() guard so write() WARN fires if writer is closed
-                long writeStart = System.currentTimeMillis();
-                jsonlWriter.write(bpmResult);
-                debugLogger.logJsonlWrite(1, 0, System.currentTimeMillis() - writeStart);
+            // Broadcast write to ALL registered JSONL writers (one per BpmListener element).
+            // Only the primary that owns the CDP session collects metrics, but all output
+            // files must contain the same data.
+            long writeStart = System.currentTimeMillis();
+            for (JsonlWriter w : allJsonlWriters) {
+                w.write(bpmResult);
             }
+            debugLogger.logJsonlWrite(1, 0, System.currentTimeMillis() - writeStart);
 
-            // Queue for GUI update
-            if (guiUpdateQueue != null) {
-                guiUpdateQueue.offer(bpmResult);
+            // Broadcast to ALL registered GUI queues so every listener's GUI shows live data.
+            for (ConcurrentLinkedQueue<BpmResult> q : allGuiQueues) {
+                q.offer(bpmResult);
             }
 
             // Update label aggregates

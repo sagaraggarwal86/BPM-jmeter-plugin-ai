@@ -2,8 +2,7 @@ package io.github.sagaraggarwal86.jmeter.bpm.gui;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.sagaraggarwal86.jmeter.bpm.core.BpmListener;
-import io.github.sagaraggarwal86.jmeter.bpm.core.LabelAggregate;
-import io.github.sagaraggarwal86.jmeter.bpm.model.*;
+import io.github.sagaraggarwal86.jmeter.bpm.model.BpmResult;
 import io.github.sagaraggarwal86.jmeter.bpm.output.CsvExporter;
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
 import org.apache.jmeter.samplers.Clearable;
@@ -16,7 +15,8 @@ import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.filechooser.FileNameExtensionFilter;
-import javax.swing.table.*;
+import javax.swing.table.TableColumn;
+import javax.swing.table.TableColumnModel;
 import javax.swing.text.AbstractDocument;
 import javax.swing.text.AttributeSet;
 import javax.swing.text.BadLocationException;
@@ -42,6 +42,13 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     private static final long serialVersionUID = 1L;
     private static final Logger log = LoggerFactory.getLogger(BpmListenerGui.class);
 
+    /**
+     * Static reference to the shared BpmListenerGui instance. JMeter shares a single GUI
+     * component across all BpmListener elements of the same type. Set in {@link #configure}.
+     * Used by BpmListener.testStarted/testEnded to notify the GUI even when the primary
+     * instance is a clone (for which GuiPackage.getGui() returns null).
+     */
+    private static volatile BpmListenerGui activeGui;
 
     private static final DateTimeFormatter TIME_FMT =
             DateTimeFormatter.ofPattern("MM/dd/yy HH:mm:ss").withZone(ZoneId.systemDefault());
@@ -88,6 +95,13 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
     // All 18 TableColumn objects stored at init — used for add/remove column visibility
     private TableColumn[] allColumns;
+
+    /**
+     * Returns the shared BpmListenerGui instance, or null if no GUI is active (CLI mode).
+     */
+    public static BpmListenerGui getActiveGui() {
+        return activeGui;
+    }
 
     public BpmListenerGui() {
         super();
@@ -402,6 +416,7 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
     @Override
     public void configure(TestElement element) {
+        activeGui = this;
         configuringElement = true; // CHANGED: Defect #2 — suppress applyAllFilters() during field population
         try {
             super.configure(element);
@@ -433,15 +448,13 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                     return;
                 }
 
-                // CHANGED: Defects #1 #2 #3 — never call clearDisplayOnly() from configure().
-                // Display data (table, score, time fields) persists across Save, navigate-away/back,
-                // and test-start configure() calls. Only clearData() (user-initiated) or
-                // testStarted() (new run) may clear the display.
-                // Use getActiveInstance() — not guiUpdateQueue presence — to determine live state.
-                // guiUpdateQueue is transient: null after deserialization even when data still exists.
-                BpmListener active = BpmListener.getActiveInstance();
-                if (active != null) {
-                    // Live test running — wire to the active instance and ensure timer is running.
+                // Display data persists across Save, navigate-away/back, and test-start configure()
+                // calls. Only clearData() (user-initiated) or testStarted() (new run) clears it.
+                // Per-element primary lookup: find the initialized primary for THIS element.
+                String eid = BpmListener.buildElementKey(element);
+                BpmListener active = BpmListener.getPrimaryForElement(eid);
+                if (active != null && active.getGuiUpdateQueue() != null) {
+                    // Live test running for this element — wire to its primary.
                     this.listenerRef = active;
                     this.propertiesRef = active.getPropertiesManager();
                     if (!updateTimer.isRunning()) {
@@ -527,15 +540,22 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     private void drainGuiQueue() {
-        BpmListener listener = BpmListener.getActiveInstance(); // CHANGED: read from the active (initialized) instance — not listenerRef, which may point to the original (uninitialized) test element
-        if (listener == null) {
-            listener = this.listenerRef;
-        } // fallback for JSONL read mode (no active test)
+        BpmListener listener = this.listenerRef;
         if (listener == null) {
             return;
         }
 
+        // If listenerRef is the original (not the primary), its queue is null.
+        // Look up the primary for this element's key — the primary has the queue.
         ConcurrentLinkedQueue<BpmResult> queue = listener.getGuiUpdateQueue();
+        if (queue == null) {
+            String elementKey = BpmListener.buildElementKey(listener);
+            BpmListener primary = BpmListener.getPrimaryForElement(elementKey);
+            if (primary != null) {
+                listener = primary;
+                queue = listener.getGuiUpdateQueue();
+            }
+        }
         if (queue == null) {
             return;
         }
@@ -582,10 +602,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     }
 
     public void testStarted() {
-        if (BpmListener.isDontStartPending()) {
-            return;
-        } // CHANGED: Defect #2 — user chose "Don't Start"; preserve loaded file data
-        // CHANGED: Feature #3 (this session) — Append removed; always clear for a new test run
+        // Global check: suppress GUI clear when the user chose "Don't Start JMeter Engine".
+        if (BpmListener.isDontStartPending()) { return; }
         allRawResults.clear();
         tableModel.clear();
         tableModel.fireTableDataChanged();

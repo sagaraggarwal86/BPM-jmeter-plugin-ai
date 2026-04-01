@@ -90,25 +90,29 @@ BpmListener.testEnded()
 - **Clone guard — `primaryByName` per-element registry**: `BpmListener` holds a
   `static final ConcurrentHashMap<String, BpmListener> primaryByName`. JMeter calls `testStarted()` on every registered
   listener instance (original + one clone per Thread Group). Each distinct element uses `putIfAbsent(getName(), this)` —
-  the first caller for that name wins and proceeds with full setup (file dialog, writer open, GUI notify); subsequent
-  callers with the same name (clones) return immediately. `primaryByName.remove(getName())` is called unconditionally at
-  the very top of `testEnded(String)` so every new run gets a fresh slot. This replaces the old global
-  `AtomicBoolean testStartLock` which allowed only ONE BpmListener element per test plan to run setup — breaking the
-  file-exists dialog when a second listener had an existing user-provided path. Each distinct element now independently
-  runs its own file-exists check. `sampleOccurred()` clone delegation uses `primaryByName.get(getName())` instead of the
-  global `activeInstance`, so clones route to their own element's primary instance.
-- **`dontStartPending` flag lifecycle**: `static volatile boolean`. When the file-exists dialog resolves to DONT_START,
-  the winning instance sets this flag and stops the engine; all subsequent `testStarted()` calls early-return. Cleared
-  unconditionally in `testEnded()`. Checked in `BpmListenerGui.testStarted()` to suppress the GUI clear when the test
-  was cancelled before starting.
+  the first caller for that name wins and proceeds with full setup; subsequent callers with the same name (clones)
+  return immediately. `primaryByName.remove(getName())` is called unconditionally at the very top of `testEnded(String)`
+  so every new run gets a fresh slot. `sampleOccurred()` clone delegation uses `primaryByName.get(getName())` instead of
+  the global `activeInstance`, so clones route to their own element's primary instance.
+- **Pre-flight file-exists scan**: The first BpmListener primary to call `testStarted()` wins a
+  `preFlightDone.compareAndSet(false, true)` and scans ALL enabled BpmListener elements in the test plan via
+  `GuiPackage.getTreeModel().getNodesOfType(BpmListener.class)`. For each enabled element with a user-provided output
+  path, it checks `Files.exists()`. If any conflicts are found, a single dialog is shown listing all conflicting files.
+  The user chooses "Overwrite" (all files) or "Don't Start JMeter Engine" (stops the engine). The decision is stored in
+  `static volatile FileOpenMode globalFileDecision` — all subsequent `testStarted()` calls read this cached decision.
+  CLI mode always overwrites silently (no tree traversal needed). `-Jbpm.output` flag is checked first as a global
+  override. `preFlightDone` and `globalFileDecision` are reset in `testEnded()` when the last primary exits
+  (`primaryByName.isEmpty()`).
+- **`isDontStartPending()` flag**: Returns `globalFileDecision == DONT_START`. Checked in `BpmListenerGui.testStarted()`
+  to suppress the GUI clear when the test was cancelled before starting.
 - **`testActuallyStarted` instance flag**: Set to `true` only when a `BpmListener` instance completes full setup in
   `testStarted()`. `testEnded()` skips all cleanup (flush, close, GUI notify) if this flag is `false`, preventing
   spurious side-effects from DONT_START or partially-initialised clone instances.
-- **File-exists dialog**: Two options only — **Overwrite** and **Don't Start** (Append was removed). Dialog is shown
-  only in GUI mode and only when `isUserProvidedOutputPath()` returns true. CLI mode always overwrites silently.
-  `FileOpenMode` enum has two values: `OVERWRITE`, `DONT_START`. `isUserProvidedOutputPath()` reads
-  `TEST_ELEMENT_OUTPUT_PATH` from the backing `TestElement`. JMeter only calls `modifyTestElement()` on navigate-away,
-  not on Start — so the path must be persisted immediately. `browseFile()` does this explicitly; a `DocumentListener` on
+- **File-exists dialog**: Two options only — **Overwrite** and **Don't Start JMeter Engine** (Append was removed).
+  Shown once per test run (not per-element) when the pre-flight scan finds conflicts. Lists all conflicting files.
+  `FileOpenMode` enum has two values: `OVERWRITE`, `DONT_START`. CLI mode always overwrites silently.
+  JMeter only calls `modifyTestElement()` on navigate-away, not on Start — so the output path must be persisted
+  immediately. `browseFile()` does this explicitly; a `DocumentListener` on
   `filenameField` (guarded by `configuringElement`) does the same for manually typed paths. Both call
   `listenerRef.setProperty(TEST_ELEMENT_OUTPUT_PATH, path)` on every change.
 - **Cached engine reference**: `cachedEngine` is populated at the very top of `testStarted()` via
@@ -145,3 +149,4 @@ BpmListener.testEnded()
 | Date       | Area                                 | What changed                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Status |
 |------------|--------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
 | 2026-03-30 | core/BpmListener, gui/BpmListenerGui | Replaced global `testStartLock` AtomicBoolean with per-element-name `primaryByName` ConcurrentHashMap so multiple BpmListener elements each independently run their own file-exists dialog check; fixed `sampleOccurred` clone delegation to use per-name registry; added `DocumentListener` on `filenameField` (guarded by `configuringElement`) to immediately persist manually typed output paths to the backing element so `isUserProvidedOutputPath()` sees them at test-start time | done   |
+| 2026-03-31 | core/BpmListener, gui/BpmListenerGui | Consolidated pre-flight file-exists scan: first primary scans ALL enabled BpmListener elements via `GuiPackage.getTreeModel().getNodesOfType()` before any setup; single dialog lists all conflicting files; decision (Overwrite / Don't Start) is global via `preFlightDone` AtomicBoolean + `globalFileDecision` volatile; removed per-element `dontStartByElement` map and `isDontStartForElement()`; GUI uses `isDontStartPending()` for global check; removed `isUserProvidedOutputPath()` (logic moved into `scanForConflictingFiles()`) | done   |

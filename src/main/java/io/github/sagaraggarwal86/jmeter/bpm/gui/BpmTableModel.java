@@ -1,10 +1,6 @@
 package io.github.sagaraggarwal86.jmeter.bpm.gui;
 
-import io.github.sagaraggarwal86.jmeter.bpm.model.BpmResult;
-import io.github.sagaraggarwal86.jmeter.bpm.model.ConsoleResult;
-import io.github.sagaraggarwal86.jmeter.bpm.model.DerivedMetrics;
-import io.github.sagaraggarwal86.jmeter.bpm.model.NetworkResult;
-import io.github.sagaraggarwal86.jmeter.bpm.model.WebVitalsResult;
+import io.github.sagaraggarwal86.jmeter.bpm.model.*;
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
 
 import javax.swing.table.AbstractTableModel;

@@ -339,6 +339,8 @@
                                 <exclude>**/gui/**</exclude>
                                 <exclude>**/BpmListener.class</exclude>
                                 <exclude>**/BpmListener$*.class</exclude>
+                                <exclude>**/LabelAggregate.class</exclude>
+                                <exclude>**/FileOpenMode.class</exclude>
                                 <exclude>**/ChromeCdpCommandExecutor.class</exclude>
                                 <exclude>**/CdpSessionManager.class</exclude>
                             </excludes>
