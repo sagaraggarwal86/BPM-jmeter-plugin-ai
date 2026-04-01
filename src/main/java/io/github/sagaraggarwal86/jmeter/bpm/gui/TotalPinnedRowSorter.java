@@ -2,7 +2,7 @@ package io.github.sagaraggarwal86.jmeter.bpm.gui;
 
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
 
-import javax.swing.RowFilter;
+import javax.swing.*;
 import javax.swing.table.TableRowSorter;
 import java.util.Comparator;
 
@@ -76,6 +76,39 @@ class TotalPinnedRowSorter extends TableRowSorter<BpmTableModel> {
             return super.getViewRowCount();
         }
         return super.convertRowIndexToView(modelIndex);
+    }
+
+    // Re-install filter on model structure changes so the excluded-last-row index stays current.
+    // fireTableDataChanged() triggers modelStructureChanged() which resets the sorter's internal
+    // mapping arrays — without reinstalling, the filter's stale state can hide all rows.
+    @Override
+    public void modelStructureChanged() {
+        installTotalFilter();
+        super.modelStructureChanged();
+    }
+
+    @Override
+    public void allRowsChanged() {
+        installTotalFilter();
+        super.allRowsChanged();
+    }
+
+    @Override
+    public void rowsInserted(int f, int e) {
+        installTotalFilter();
+        super.rowsInserted(f, e);
+    }
+
+    @Override
+    public void rowsDeleted(int f, int e) {
+        installTotalFilter();
+        super.rowsDeleted(f, e);
+    }
+
+    @Override
+    public void rowsUpdated(int f, int e) {
+        installTotalFilter();
+        super.rowsUpdated(f, e);
     }
 
     // -- Per-column comparators -----------------------------------------------

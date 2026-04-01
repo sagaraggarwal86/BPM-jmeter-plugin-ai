@@ -206,6 +206,22 @@ BPM is designed as a pure observer with minimal overhead:
 These numbers are specific to Tiers 1-4. Tier 5 (Full Trace) was excluded from v1 due to 10-15% browser overhead that
 would skew load test results.
 
+## Multiple BPM Listener Instances
+
+A test plan may contain more than one BPM Listener element (e.g. one per Thread Group, each writing to a different
+output file). Each instance operates independently:
+
+- **Per-element file check:** On test start, each BPM Listener individually checks whether its configured output file
+  already exists. If it does (and the path was explicitly set by the user), a dialog appears for that specific listener
+  showing the listener name, file path, and two options: **Overwrite** or **Don't Start JMeter Engine**.
+- **Independent lifecycle:** Choosing "Don't Start JMeter Engine" for one listener disables only that listener — other
+  BPM Listener elements in the test plan proceed normally and collect metrics as expected.
+- **No cross-contamination:** Each listener maintains its own JSONL writer, CDP sessions, health counters, and GUI
+  state. Results from one listener never appear in another listener's output.
+- **Default output path:** When no user-provided path is configured, all listeners fall back to the same default file
+  (`bpm-results.jsonl`). If you use multiple listeners, always assign each one a distinct output file path to avoid
+  overwriting.
+
 ## Known Limitations
 
 - **Chrome-only:** CDP metrics require Chrome or Chromium. Firefox, Safari, and Edge are not supported. Non-Chrome

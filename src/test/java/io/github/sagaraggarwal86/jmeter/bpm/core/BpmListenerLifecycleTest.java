@@ -3,6 +3,9 @@ package io.github.sagaraggarwal86.jmeter.bpm.core;
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -15,10 +18,10 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("testStarted() initializes all internal state")
-    void testStarted_initializesState() {
+    void testStarted_initializesState(@TempDir Path tempDir) {
         BpmListener listener = new BpmListener();
-        // testStarted() will try to resolve JMETER_HOME which is null in test —
-        // properties manager falls back to user.dir
+        listener.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results.jsonl").toString());
         listener.testStarted();
 
         assertNotNull(listener.getGuiUpdateQueue(), "GUI queue should be initialized");
@@ -38,8 +41,10 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("clearData() resets aggregates and queue")
-    void clearData_resetsState() {
+    void clearData_resetsState(@TempDir Path tempDir) {
         BpmListener listener = new BpmListener();
+        listener.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results.jsonl").toString());
         listener.testStarted();
 
         listener.clearData();
@@ -52,8 +57,10 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("Double testStarted/testEnded cycle works cleanly")
-    void doubleLifecycle_worksCleanly() {
+    void doubleLifecycle_worksCleanly(@TempDir Path tempDir) {
         BpmListener listener = new BpmListener();
+        listener.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results.jsonl").toString());
 
         listener.testStarted();
         listener.testEnded();
@@ -65,8 +72,10 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("testEnded after testStarted does not throw")
-    void testEnded_afterStart_noException() {
+    void testEnded_afterStart_noException(@TempDir Path tempDir) {
         BpmListener listener = new BpmListener();
+        listener.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results.jsonl").toString());
         listener.testStarted();
 
         // Calling sampleOccurred without a proper SampleEvent context
@@ -78,12 +87,16 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("Two listeners with distinct element IDs both complete setup independently")
-    void twoDistinctElements_bothComplete_setup() {
+    void twoDistinctElements_bothComplete_setup(@TempDir Path tempDir) {
         BpmListener l1 = new BpmListener();
         BpmListener l2 = new BpmListener();
         // Assign distinct IDs — simulates two BpmListener elements in the same plan
         l1.setProperty(BpmConstants.TEST_ELEMENT_ID, java.util.UUID.randomUUID().toString());
         l2.setProperty(BpmConstants.TEST_ELEMENT_ID, java.util.UUID.randomUUID().toString());
+        l1.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results-1.jsonl").toString());
+        l2.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results-2.jsonl").toString());
 
         l1.testStarted();
         l2.testStarted();
@@ -97,15 +110,18 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("Clone sharing element ID skips setup and delegates sampleOccurred to primary")
-    void cloneWithSameId_skipsSetup() {
+    void cloneWithSameId_skipsSetup(@TempDir Path tempDir) {
         String sharedId = java.util.UUID.randomUUID().toString();
         BpmListener primary = new BpmListener();
         BpmListener clone = new BpmListener();
+        String outputPath = tempDir.resolve("bpm-results.jsonl").toString();
         primary.setProperty(BpmConstants.TEST_ELEMENT_ID, sharedId);
         clone.setProperty(BpmConstants.TEST_ELEMENT_ID, sharedId);
+        primary.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, outputPath);
+        clone.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, outputPath); // same path = true clone
 
         primary.testStarted(); // primary wins the slot
-        clone.testStarted();   // clone must return immediately — no NPE, no state init
+        clone.testStarted();   // clone must return immediately — same composite key
 
         // Clone's queue is null because it never ran testStarted setup
         assertNull(clone.getGuiUpdateQueue(),
@@ -119,8 +135,10 @@ class BpmListenerLifecycleTest {
 
     @Test
     @DisplayName("dontStartPending is false after a successful start and after testEnded")
-    void dontStartPending_isFalse_afterNormalLifecycle() {
+    void dontStartPending_isFalse_afterNormalLifecycle(@TempDir Path tempDir) {
         BpmListener l1 = new BpmListener();
+        l1.setProperty(BpmConstants.TEST_ELEMENT_OUTPUT_PATH,
+                tempDir.resolve("bpm-results.jsonl").toString());
 
         // Verify initial state
         assertFalse(BpmListener.isDontStartPending());
