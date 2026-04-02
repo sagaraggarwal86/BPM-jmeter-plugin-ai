@@ -214,7 +214,7 @@ The listener provides a single-panel GUI:
 - **Test Time Info** — Start, End, Duration (live-updating during test)
 - **Overall Performance Score** — colored progress bar with Good / Needs Work / Poor counts
 - **Results Table** — 10 always-visible derived columns + 8 toggleable raw columns with SLA coloring
-- **AI Report** — Provider dropdown + Generate AI Report button
+- **AI Report** — Provider dropdown + Generate AI Report button (opens save dialog)
 - **Save Table Data** — export visible data to CSV
 
 ### Column Selector
@@ -228,7 +228,7 @@ need to dig deeper.
 ## AI Performance Report
 
 Click **Generate AI Report** to analyse the captured BPM data with any supported AI provider.
-The report opens automatically in your browser.
+A save dialog lets you choose where to save the HTML report. The report opens automatically in your browser.
 
 **Supported providers:** Groq (free), Gemini (free), Mistral (free), DeepSeek (free),
 Cerebras (free), OpenAI (paid), Claude (paid), Ollama (local / free) — or any OpenAI-compatible endpoint.
@@ -240,38 +240,45 @@ This ensures deterministic, accurate outputs regardless of which AI model is use
 
 | Pre-Computed Field | Description                                                |
 |--------------------|------------------------------------------------------------|
-| SLA verdicts       | GOOD / NEEDS_WORK / POOR per metric per label              |
+| SLA verdicts       | GOOD / NEEDS_WORK / POOR per metric per transaction        |
 | Trend analysis     | RISING / FALLING / STABLE direction with percentage change |
 | Alert sentences    | Pre-written prose the AI copies verbatim                   |
-| Improvement areas  | Per-label categorical detection                            |
+| Improvement areas  | Per-transaction categorical detection                      |
+| Critical Findings  | Root cause diagnosis + recommended actions                 |
 
-The AI provider's role (~10% of the work) is to narrate the pre-computed facts into readable
-prose. Fill-in-the-blank templates ensure compatibility with even weak models.
+The AI provider's role (~5% of the work) is to generate 3 sections of narrative prose
+(Executive Summary, Recommendations, Risk Assessment). Java generates the remaining 4 panels
+(Performance Metrics, Performance Trends, SLA Compliance, Critical Findings).
 
-### Report Sections
+### Report Panels
 
-| Section                 | Description                                                  |
-|-------------------------|--------------------------------------------------------------|
-| Executive Summary       | Overall score, worst label, key finding, trend summary       |
-| SLA Compliance Matrix   | Per-metric per-label GOOD / NEEDS_WORK / POOR table          |
-| Label Analysis Table    | All labels with metrics, verdicts, and improvement areas     |
-| Per-Label Deep Dive     | Detailed analysis for each label (or grouped for >20 labels) |
-| Trend Analysis          | Time-series direction, alerts, stability assessment          |
-| Risks & Recommendations | Prioritised action items with evidence                       |
+| # | Panel               | Source | Description                                                              |
+|---|---------------------|--------|--------------------------------------------------------------------------|
+| 1 | Executive Summary   | AI     | Non-technical overview with key findings and trend summary               |
+| 2 | Performance Metrics | Java   | Full data table with pagination, column sorting, and transaction search  |
+| 3 | Performance Trends  | Java   | 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render) with SLA lines  |
+| 4 | SLA Compliance      | Java   | Pass/Warning/Fail verdict matrix per metric per transaction              |
+| 5 | Critical Findings   | Java   | Only transactions needing attention, with root cause and actions         |
+| 6 | Recommendations     | AI     | Improvement areas with affected transactions and priority                |
+| 7 | Risk Assessment     | AI     | Headroom, boundary, cross-page patterns, and trend risks                |
 
 ### Report Features
 
-- Sidebar navigation derived from H2 headings
-- Metadata grid (scenario name, description, virtual users, provider)
-- Chart.js time-series charts (Score, LCP, FCP, TTFB over time)
-- Truncation detection with section-completion notice
-- Self-contained HTML — one file, no external dependencies except Chart.js CDN
+- Sidebar panel navigation
+- Metadata grid (scenario name, virtual users, run date/time, duration)
+- Page-based pagination with configurable rows per page (10/25/50/100)
+- Click-to-sort on all table columns (ascending/descending)
+- Transaction search filter (Performance Metrics + SLA Compliance)
+- Per-transaction chart filter in Performance Trends
+- SLA threshold lines on charts (green for Score, red for LCP/FCP/TTFB/CLS)
+- Excel export via SheetJS (all transactions, not limited by pagination)
+- Print/PDF CSS for offline sharing
+- Self-contained HTML — one file, no external dependencies except Chart.js and SheetJS CDN
+- Footer with generation timestamp and provider name
 
 ### API Key Setup
 
 Place `ai-reporter.properties` in `<JMETER_HOME>/bin/` and set at least one provider's `api.key`.
-This is the same file used by the JAAR plugin — configure once, both plugins share it.
-
 Select the provider from the dropdown and click **Generate AI Report**.
 
 ### Custom Providers
@@ -510,8 +517,8 @@ A test plan may contain more than one BPM Listener element. Each instance operat
 - **WebDriver Sampler required:** BPM instruments only WebDriver Samplers. HTTP Samplers and
   other sampler types are silently skipped.
 - **Pure observer:** BPM never modifies SampleResults, JTL output, or other listeners' behavior.
-- **Charts require internet:** The HTML report loads Chart.js from a CDN. Open in a browser with
-  internet access for charts to render.
+- **Charts require internet:** The HTML report loads Chart.js and SheetJS from CDNs. Open in a
+  browser with internet access for charts and Excel export to work.
 
 ---
 
