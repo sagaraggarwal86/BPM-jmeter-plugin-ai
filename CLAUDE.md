@@ -77,20 +77,27 @@ Sampler via Chrome DevTools Protocol. Includes optional AI-powered analysis repo
 
 ### AI Analysis Architecture
 
-- **Java does ~90% of work**: Parses JSONL, aggregates stats, computes SLA verdicts (GOOD/NEEDS_WORK/POOR), trend
-  analysis (RISING/FALLING/STABLE), alert sentences — all pre-computed.
-- **AI does ~10%**: Narrates pre-computed facts into readable prose. Fill-in-the-blank templates for weak model
-  compatibility.
+- **Java does ~95% of work**: Performance Metrics table, SLA Compliance verdicts, Critical Findings (diagnosis + actions),
+  Performance Trends (6 charts with per-label filter), pagination, sorting, search — all Java-generated.
+- **AI does ~5%**: Generates 3 sections of narrative prose (Executive Summary, Recommendations, Risk Assessment).
 - **7 providers**: groq, gemini, mistral, deepseek, cerebras, openai, claude. Shared `ai-reporter.properties` config.
 - **CLI workflow** (two-step):
   ```
   jmeter -n -t test.jmx -Jbpm.output=results.jsonl    # Step 1: run test
   bpm-ai-report -i results.jsonl --provider groq        # Step 2: generate AI report
   ```
-- **Prompt design**: 9 absolute rules, 6 sections with audience-specific templates, 8 edge cases, trend analysis with
+- **Prompt design**: 8 absolute rules, 3 sections with audience-specific templates, 9 edge cases, trend analysis with
   pre-computed direction/alerts. System prompt in `src/main/resources/bpm-ai-prompt.txt`.
-- **HTML report**: CommonMark Markdown→HTML + Chart.js time-series charts (Score, LCP, FCP, TTFB over time) + metadata
-  grid + sidebar nav.
+- **HTML report panels** (7 total):
+  1. Executive Summary (AI) — non-technical stakeholder overview
+  2. Performance Metrics (Java) — full data table with pagination, sorting, search
+  3. Performance Trends (Java) — 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render Time) with SLA lines + per-label filter
+  4. SLA Compliance (Java) — verdict matrix with Pass/Warning/Fail per metric, search
+  5. Critical Findings (Java) — only transactions needing attention, with root cause + recommended action
+  6. Recommendations (AI) — improvement area table with affected transactions and priority
+  7. Risk Assessment (AI) — headroom, boundary, cross-page pattern, trend risks
+- **Report features**: sidebar navigation, metadata grid, page-based pagination + column sorting on all tables,
+  transaction search, Excel export (SheetJS), print/PDF CSS, save dialog (JFileChooser), Chart.js CDN.
 
 ### Key Constraints
 
