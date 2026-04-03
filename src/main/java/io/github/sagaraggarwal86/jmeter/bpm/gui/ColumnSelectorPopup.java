@@ -68,14 +68,31 @@ public final class ColumnSelectorPopup extends JPopupMenu {
     }
 
     /**
+     * Sets the visibility state of all 8 raw columns from a boolean array.
+     * Fires a single change notification so the table updates.
+     *
+     * @param visibility array of 8 booleans; index 0 = FCP, index 7 = Warns
+     */
+    public void setVisibility(boolean[] visibility) {
+        for (int i = 0; i < BpmConstants.RAW_COLUMN_COUNT && i < visibility.length; i++) {
+            checkBoxes[i].removeActionListener(changeListener);
+            checkBoxes[i].setSelected(visibility[i]);
+            checkBoxes[i].addActionListener(changeListener);
+        }
+        changeListener.actionPerformed(
+                new java.awt.event.ActionEvent(this, java.awt.event.ActionEvent.ACTION_PERFORMED, "restore"));
+    }
+
+    /**
      * Resets all checkboxes to their defaults (all OFF). Called during Clear/Clear All
      * and at test restart.
      */
     public void resetToDefaults() {
         for (int i = 0; i < BpmConstants.RAW_COLUMN_COUNT; i++) {
+            checkBoxes[i].removeActionListener(changeListener);
             checkBoxes[i].setSelected(BpmConstants.RAW_COLUMNS_DEFAULT_VISIBILITY[i]);
+            checkBoxes[i].addActionListener(changeListener);
         }
-        // Fire a single change notification so the table updates
         changeListener.actionPerformed(
                 new java.awt.event.ActionEvent(this, java.awt.event.ActionEvent.ACTION_PERFORMED, "reset"));
     }

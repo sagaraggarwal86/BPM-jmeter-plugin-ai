@@ -59,7 +59,7 @@ public final class BpmErrorHandler {
         switch (currentState) {
             case HEALTHY -> {
                 threadStates.put(threadName, ThreadState.RE_INIT_NEEDED);
-                log.warn("BPM: [{}] collection error", threadName, exception);
+                log.debug("BPM: [{}] collection error", threadName, exception);
                 logOnceTracker.warnOnce(threadName, "collection-error",
                         "CDP collection error. Will attempt re-init. Cause: " + exception.getMessage());
             }
@@ -87,7 +87,7 @@ public final class BpmErrorHandler {
     public void handleSessionError(String threadName, Exception exception) {
         failureCount.incrementAndGet();
         threadStates.put(threadName, ThreadState.DISABLED);
-        log.warn("BPM: [{}] session re-init failed", threadName, exception);
+        log.debug("BPM: [{}] session re-init failed", threadName, exception);
         logOnceTracker.warnOnce(threadName, "session-disabled",
                 "CDP re-init failed. BPM disabled for this thread. Cause: " + exception.getMessage());
     }
@@ -101,7 +101,13 @@ public final class BpmErrorHandler {
     public void markReInitSuccess(String threadName) {
         reInitCount.incrementAndGet();
         threadStates.put(threadName, ThreadState.HEALTHY);
-        log.info("BPM: [{}] CDP session re-initialized successfully.", threadName);
+        // First re-init per thread at INFO (confirms recovery); subsequent at DEBUG
+        // to avoid flooding the log during normal browser recycling.
+        if (logOnceTracker.markOnce(threadName, "reinit-success")) {
+            log.info("BPM: [{}] CDP session re-initialized successfully.", threadName);
+        } else {
+            log.debug("BPM: [{}] CDP session re-initialized successfully.", threadName);
+        }
     }
 
     /**
@@ -112,6 +118,23 @@ public final class BpmErrorHandler {
      */
     public boolean isThreadDisabled(String threadName) {
         return threadStates.getOrDefault(threadName, ThreadState.HEALTHY) == ThreadState.DISABLED;
+    }
+
+    /**
+     * Resets a disabled thread back to {@code HEALTHY} so that CDP session
+     * initialization can be attempted with a new browser instance.
+     *
+     * <p>Called when a thread is {@code DISABLED} but a fresh browser has been
+     * detected (e.g., WebDriverConfig created a new ChromeDriver after a crash).
+     * Also clears the log-once tracker entries for this thread so that relevant
+     * diagnostic messages are logged again for the new session.</p>
+     *
+     * @param threadName the JMeter thread name
+     */
+    public void resetThread(String threadName) {
+        threadStates.put(threadName, ThreadState.HEALTHY);
+        logOnceTracker.resetThread(threadName);
+        log.info("BPM: [{}] Thread reset from DISABLED to HEALTHY — new browser detected.", threadName);
     }
 
     /**

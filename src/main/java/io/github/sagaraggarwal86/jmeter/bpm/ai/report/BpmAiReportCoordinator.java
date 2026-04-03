@@ -52,9 +52,6 @@ public final class BpmAiReportCoordinator {
                 Collections.emptyList(), Collections.emptyMap(), Collections.emptyList());
     }
 
-    /** Result of HTML generation (before saving to disk). */
-    public record GenerateResult(String html, String suggestedFilename) {}
-
     /**
      * Generates the AI report HTML without saving to disk.
      * Used by the GUI launcher which shows a save dialog.
@@ -102,12 +99,12 @@ public final class BpmAiReportCoordinator {
     }
 
     private static String buildHtml(Map<String, LabelAggregate> aggregates,
-                                     BpmPropertiesManager props,
-                                     AiProviderConfig config,
-                                     BpmHtmlReportRenderer.RenderConfig renderConfig,
-                                     List<BpmTimeBucket> timeBuckets,
-                                     Map<String, List<BpmTimeBucket>> perLabelBuckets,
-                                     List<String[]> metricsTable) throws IOException {
+                                    BpmPropertiesManager props,
+                                    AiProviderConfig config,
+                                    BpmHtmlReportRenderer.RenderConfig renderConfig,
+                                    List<BpmTimeBucket> timeBuckets,
+                                    Map<String, List<BpmTimeBucket>> perLabelBuckets,
+                                    List<String[]> metricsTable) throws IOException {
         // 1. Load system prompt
         String systemPrompt = BpmPromptLoader.load();
         if (systemPrompt == null) {
@@ -140,5 +137,11 @@ public final class BpmAiReportCoordinator {
             log.warn("BPM AI: Failed to open report in browser: {}. Report saved at: {}",
                     e.getMessage(), reportPath);
         }
+    }
+
+    /**
+     * Result of HTML generation (before saving to disk).
+     */
+    public record GenerateResult(String html, String suggestedFilename) {
     }
 }

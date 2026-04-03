@@ -196,6 +196,7 @@
                 <exclude>**/cli/**</exclude>
                 <exclude>**/BpmListener.class</exclude>
                 <exclude>**/BpmListener$*.class</exclude>
+                <exclude>**/BpmCollector.class</exclude>
                 <exclude>**/LabelAggregate.class</exclude>
                 <exclude>**/FileOpenMode.class</exclude>
                 <exclude>**/ChromeCdpCommandExecutor.class</exclude>

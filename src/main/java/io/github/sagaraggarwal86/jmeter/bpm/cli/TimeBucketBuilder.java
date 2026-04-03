@@ -86,7 +86,7 @@ public final class TimeBucketBuilder {
     }
 
     private static List<BpmTimeBucket> buildBuckets(List<RawSample> samples,
-                                                     long minEpoch, long bucketSizeMs) {
+                                                    long minEpoch, long bucketSizeMs) {
         TreeMap<Long, List<RawSample>> bucketMap = new TreeMap<>();
         for (RawSample s : samples) {
             long bucketKey = ((s.epochMs - minEpoch) / bucketSizeMs) * bucketSizeMs + minEpoch;

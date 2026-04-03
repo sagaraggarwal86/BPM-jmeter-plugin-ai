@@ -138,6 +138,39 @@ class JsonlWriterTest {
     }
 
     @Test
+    @DisplayName("flush() without open is a safe no-op")
+    void flush_withoutOpen_noException() {
+        JsonlWriter writer = new JsonlWriter();
+        assertDoesNotThrow(writer::flush);
+    }
+
+    @Test
+    @DisplayName("getOutputPath returns null before open and path after open")
+    void getOutputPath_nullBeforeOpen_pathAfterOpen() throws IOException {
+        JsonlWriter writer = new JsonlWriter();
+        assertNull(writer.getOutputPath());
+
+        Path path = tempDir.resolve("path.jsonl");
+        writer.open(path);
+        assertEquals(path, writer.getOutputPath());
+        writer.close();
+    }
+
+    @Test
+    @DisplayName("isOpen returns false before open, true after open, false after close")
+    void isOpen_lifecycle() throws IOException {
+        JsonlWriter writer = new JsonlWriter();
+        assertFalse(writer.isOpen());
+
+        Path path = tempDir.resolve("lifecycle.jsonl");
+        writer.open(path);
+        assertTrue(writer.isOpen());
+
+        writer.close();
+        assertFalse(writer.isOpen());
+    }
+
+    @Test
     @DisplayName("open(path, true) appends records after existing content")
         // CHANGED: Feature #3 — append mode
     void open_appendMode_appendsToExistingFile() throws IOException {

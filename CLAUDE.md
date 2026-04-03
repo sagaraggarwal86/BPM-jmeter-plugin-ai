@@ -2,6 +2,7 @@
 
 ## Working Rules
 
+- Target JMeter 5.6.3 exclusively — verify all APIs, interfaces, and classes exist in 5.6.3 before using them
 - Never change git history or Java 17 implementation
 - Never assume — ask if in doubt
 - Never make changes to code until user confirms
@@ -58,13 +59,22 @@ Sampler via Chrome DevTools Protocol. Includes optional AI-powered analysis repo
   Exception: `WebVitalsCollector` tracks previous LCP for SPA stale detection.
 - **All runtime deps `provided`**: JMeter core, Selenium, Jackson on JMeter classpath. Only CommonMark is shaded (
   relocated to `io.github.sagaraggarwal86.shaded.commonmark`).
-- **Clone guard — `primaryByName`**: `ConcurrentHashMap<String, BpmListener>` keyed by composite `elementId|outputPath`.
-  First `putIfAbsent` wins setup; clones skip. Cleared per-element in `testEnded()`.
+- **Clone delegation**: JMeter's `AbstractTestElement.clone()` creates new instances via the no-arg
+  constructor — transient fields (testInitialized, guiUpdateQueue, rawResults, jsonlWriter) are NOT shared.
+  Per-thread clones delegate `sampleOccurred()` to the primary registered in `primaryByName`.
+  Only the primary (execution-tree element that ran `testStarted()`) owns mutable state.
+- **Execution tree ≠ GUI tree**: JMeter creates a separate execution tree for test runs. `testStarted()`
+  runs on execution-tree elements (different object identity from GUI-tree elements). `configure()` receives
+  GUI-tree elements. `gui.testEnded()` must persist rawResults from the execution primary to the GUI element
+  via `setRawResults()` so data survives post-test `configure()` calls.
+- **Aggregate Report pattern**: GUI follows JMeter's `StatVisualizer` design — data lives in the TestElement
+  (`BpmListener.rawResults`), GUI reads from it unconditionally in `configure()`. Timer runs forever with
+  direct model updates (`addOrUpdateResult` + `fireTableDataChanged`), no queue-drain-rebuild. Full
+  `rebuildTableFromRaw()` only on filter change or file load. Column visibility persisted in TestElement
+  properties, not static caches.
 - **Pre-flight file scan**: First primary wins `preFlightDone.compareAndSet(false, true)`, scans ALL enabled
   BpmListeners via `GuiPackage.getTreeModel().getNodesOfType()`. Single dialog lists all conflicts. Decision cached in
   `globalFileDecision` (OVERWRITE/DONT_START). CLI always overwrites.
-- **Broadcast write**: Static `allJsonlWriters` + `allGuiQueues` (CopyOnWriteArrayList). The primary that owns CDP
-  writes to ALL registered writers/queues.
 - **Output path priority**: `-Jbpm.output` > GUI TestElement property > `bpm.properties` > default `bpm-results.jsonl`.
 - **`pendingFreshClear`**: `createTestElement()` strips properties + sets flag. `configure()` clears display and returns
   early for new elements.
@@ -77,7 +87,8 @@ Sampler via Chrome DevTools Protocol. Includes optional AI-powered analysis repo
 
 ### AI Analysis Architecture
 
-- **Java does ~95% of work**: Performance Metrics table, SLA Compliance verdicts, Critical Findings (diagnosis + actions),
+- **Java does ~95% of work**: Performance Metrics table, SLA Compliance verdicts, Critical Findings (diagnosis +
+  actions),
   Performance Trends (6 charts with per-label filter), pagination, sorting, search — all Java-generated.
 - **AI does ~5%**: Generates 3 sections of narrative prose (Executive Summary, Recommendations, Risk Assessment).
 - **7 providers**: groq, gemini, mistral, deepseek, cerebras, openai, claude. Shared `ai-reporter.properties` config.
@@ -89,13 +100,14 @@ Sampler via Chrome DevTools Protocol. Includes optional AI-powered analysis repo
 - **Prompt design**: 8 absolute rules, 3 sections with audience-specific templates, 9 edge cases, trend analysis with
   pre-computed direction/alerts. System prompt in `src/main/resources/bpm-ai-prompt.txt`.
 - **HTML report panels** (7 total):
-  1. Executive Summary (AI) — non-technical stakeholder overview
-  2. Performance Metrics (Java) — full data table with pagination, sorting, search
-  3. Performance Trends (Java) — 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render Time) with SLA lines + per-label filter
-  4. SLA Compliance (Java) — verdict matrix with Pass/Warning/Fail per metric, search
-  5. Critical Findings (Java) — only transactions needing attention, with root cause + recommended action
-  6. Recommendations (AI) — improvement area table with affected transactions and priority
-  7. Risk Assessment (AI) — headroom, boundary, cross-page pattern, trend risks
+    1. Executive Summary (AI) — non-technical stakeholder overview
+    2. Performance Metrics (Java) — full data table with pagination, sorting, search
+    3. Performance Trends (Java) — 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render Time) with SLA lines +
+       per-label filter
+    4. SLA Compliance (Java) — verdict matrix with Pass/Warning/Fail per metric, search
+    5. Critical Findings (Java) — only transactions needing attention, with root cause + recommended action
+    6. Recommendations (AI) — improvement area table with affected transactions and priority
+    7. Risk Assessment (AI) — headroom, boundary, cross-page pattern, trend risks
 - **Report features**: sidebar navigation, metadata grid, page-based pagination + column sorting on all tables,
   transaction search, Excel export (SheetJS), print/PDF CSS, save dialog (JFileChooser), Chart.js CDN.
 
@@ -113,3 +125,17 @@ Sampler via Chrome DevTools Protocol. Includes optional AI-powered analysis repo
 - Pure observer — never crashes the test; all exceptions caught; graceful degradation.
 - UI preserves `AbstractListenerGui` and `Clearable` contracts.
 - `TotalPinnedRowSorter` must pin TOTAL to last view row for all sort directions.
+
+### Reference Architecture — JMeter Aggregate Report (`StatVisualizer`)
+
+When making GUI/state management decisions, refer to JMeter's Aggregate Report (`StatVisualizer` + `ResultCollector`)
+as the proven reference implementation:
+
+- **Data ownership**: Data lives in the TestElement, not the GUI. GUI reads from the element unconditionally.
+- **`configure()`**: Always sync GUI with element data — no `switchedElement` guards or conditional rebuilds.
+- **Timer**: Start once in constructor, never stop. Use a `volatile boolean dataChanged` flag — idle ticks cost nothing.
+- **Model updates**: Update aggregate rows in-place; timer just calls `fireTableDataChanged()`. Full rebuild only on
+  filter changes.
+- **Clone delegation**: `AbstractTestElement.clone()` creates new instances — transient state is NOT shared.
+  Per-thread clones must delegate to the primary (tree element). `ResultCollector` uses a static `FileEntry` map.
+- **Per-element settings**: Persist in TestElement properties via `modifyTestElement()`/`configure()`, not static caches.

@@ -168,5 +168,85 @@ class LabelAggregateTest {
 
             assertEquals(BpmConstants.BOTTLENECK_SERVER, agg.getPrimaryImprovementArea());
         }
+
+        @Test
+        @DisplayName("Average server ratio and FCP-LCP gap computed correctly")
+        void multipleUpdates_serverRatioAndGap() {
+            DerivedMetrics d1 = new DerivedMetrics(400L, 30.0, null, 100L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 80);
+            DerivedMetrics d2 = new DerivedMetrics(600L, 50.0, null, 200L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 90);
+            agg.update(d1, null, null, null);
+            agg.update(d2, null, null, null);
+
+            assertEquals(500, agg.getAverageRenderTime());
+            assertEquals(40.0, agg.getAverageServerRatio(), 0.001);
+            assertEquals(150, agg.getAverageFcpLcpGap());
+        }
+
+        @Test
+        @DisplayName("Network averages computed from non-null samples")
+        void multipleUpdates_networkAverages() {
+            agg.update(minDerived(), null,
+                    new NetworkResult(10, 20000L, 0, List.of()), null);
+            agg.update(minDerived(), null,
+                    new NetworkResult(30, 60000L, 0, List.of()), null);
+
+            assertEquals(20, agg.getAverageRequests());
+            assertEquals(40000, agg.getAverageBytes());
+        }
+    }
+
+    @Nested
+    @DisplayName("FrontendTime and Headroom averages")
+    class FrontendTimeAndHeadroom {
+
+        @Test
+        @DisplayName("Average frontendTime computed over non-null samples only")
+        void frontendTime_averagedOverNonNull() {
+            DerivedMetrics withFt = new DerivedMetrics(0L, 0.0, 300L, 0L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+            DerivedMetrics withoutFt = new DerivedMetrics(0L, 0.0, null, 0L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+            DerivedMetrics withFt2 = new DerivedMetrics(0L, 0.0, 500L, 0L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+
+            agg.update(withFt, null, null, null);
+            agg.update(withoutFt, null, null, null);
+            agg.update(withFt2, null, null, null);
+
+            assertEquals(400L, agg.getAverageFrontendTime(), "Average of 300 and 500");
+        }
+
+        @Test
+        @DisplayName("Average frontendTime is null when no samples have frontendTime")
+        void frontendTime_nullWhenNoSamples() {
+            agg.update(minDerived(), null, null, null);
+            assertNull(agg.getAverageFrontendTime());
+        }
+
+        @Test
+        @DisplayName("Average headroom computed over non-null samples only")
+        void headroom_averagedOverNonNull() {
+            DerivedMetrics withH = new DerivedMetrics(0L, 0.0, null, 0L,
+                    null, 40, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+            DerivedMetrics withoutH = new DerivedMetrics(0L, 0.0, null, 0L,
+                    null, null, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+            DerivedMetrics withH2 = new DerivedMetrics(0L, 0.0, null, 0L,
+                    null, 60, 0.0, BpmConstants.BOTTLENECK_NONE, List.of(), 50);
+
+            agg.update(withH, null, null, null);
+            agg.update(withoutH, null, null, null);
+            agg.update(withH2, null, null, null);
+
+            assertEquals(50, agg.getAverageHeadroom(), "Average of 40 and 60");
+        }
+
+        @Test
+        @DisplayName("Average headroom is null when no samples have headroom")
+        void headroom_nullWhenNoSamples() {
+            agg.update(minDerived(), null, null, null);
+            assertNull(agg.getAverageHeadroom());
+        }
     }
 }

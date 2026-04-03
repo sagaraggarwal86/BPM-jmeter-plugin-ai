@@ -252,14 +252,14 @@ The AI provider's role (~5% of the work) is to generate 3 sections of narrative 
 
 ### Report Panels
 
-| # | Panel               | Source | Description                                                              |
-|---|---------------------|--------|--------------------------------------------------------------------------|
-| 1 | Executive Summary   | AI     | Non-technical overview with key findings and trend summary               |
-| 2 | Performance Metrics | Java   | Full data table with pagination, column sorting, and transaction search  |
-| 3 | Performance Trends  | Java   | 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render) with SLA lines  |
-| 4 | SLA Compliance      | Java   | Pass/Warning/Fail verdict matrix per metric per transaction              |
-| 5 | Critical Findings   | Java   | Only transactions needing attention, with root cause and actions         |
-| 6 | Recommendations     | AI     | Improvement areas with affected transactions and priority                |
+| # | Panel               | Source | Description                                                             |
+|---|---------------------|--------|-------------------------------------------------------------------------|
+| 1 | Executive Summary   | AI     | Non-technical overview with key findings and trend summary              |
+| 2 | Performance Metrics | Java   | Full data table with pagination, column sorting, and transaction search |
+| 3 | Performance Trends  | Java   | 6 Chart.js charts (Score, LCP, FCP, TTFB, CLS, Render) with SLA lines   |
+| 4 | SLA Compliance      | Java   | Pass/Warning/Fail verdict matrix per metric per transaction             |
+| 5 | Critical Findings   | Java   | Only transactions needing attention, with root cause and actions        |
+| 6 | Recommendations     | AI     | Improvement areas with affected transactions and priority               |
 | 7 | Risk Assessment     | AI     | Headroom, boundary, cross-page patterns, and trend risks                |
 
 ### Report Features

@@ -31,7 +31,7 @@ public final class JsonlWriter {
     /**
      * Number of records between automatic flushes.
      */
-    private static final int FLUSH_INTERVAL = 10;
+    private static final int FLUSH_INTERVAL = 1;
 
     private final ObjectMapper objectMapper;
     private BufferedWriter writer;
@@ -54,7 +54,7 @@ public final class JsonlWriter {
      * @param path the output file path
      * @throws IOException if the file cannot be created or opened
      */
-    public void open(Path path) throws IOException {
+    public synchronized void open(Path path) throws IOException {
         open(path, false);
     }
 
@@ -70,7 +70,7 @@ public final class JsonlWriter {
      * @throws IOException if the file cannot be created or opened
      */
     // CHANGED: Feature #3 — append mode support for file-exists dialog
-    public void open(Path path, boolean append) throws IOException {
+    public synchronized void open(Path path, boolean append) throws IOException {
         this.outputPath = path;
         this.recordsSinceFlush = 0;
         // Ensure parent directories exist

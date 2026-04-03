@@ -49,4 +49,41 @@ class BpmConstantsTest {
         assertNotNull(BpmConstants.getTooltip(BpmConstants.COL_IDX_ERRS));
         assertNotNull(BpmConstants.getTooltip(BpmConstants.COL_IDX_WARNS));
     }
+
+    @Test
+    @DisplayName("getTooltip returns null for invalid column index")
+    void getTooltip_invalidIndex_returnsNull() {
+        assertNull(BpmConstants.getTooltip(-1));
+        assertNull(BpmConstants.getTooltip(999));
+    }
+
+    @Test
+    @DisplayName("getTooltip covers server ratio and FCP-LCP gap columns")
+    void getTooltip_additionalColumns() {
+        assertNotNull(BpmConstants.getTooltip(BpmConstants.COL_IDX_SERVER_RATIO));
+        assertNotNull(BpmConstants.getTooltip(BpmConstants.COL_IDX_FCP_LCP_GAP));
+    }
+
+    @Test
+    @DisplayName("getImprovementAreaValueTooltip returns tooltip for known values and null for unknown")
+    void improvementAreaTooltip_knownAndUnknown() {
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_NONE));
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_SERVER));
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_RELIABILITY));
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_RESOURCE));
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_CLIENT));
+        assertNotNull(BpmConstants.getImprovementAreaValueTooltip(BpmConstants.BOTTLENECK_LAYOUT));
+        assertNull(BpmConstants.getImprovementAreaValueTooltip(null));
+        assertNull(BpmConstants.getImprovementAreaValueTooltip("Unknown Value"));
+    }
+
+    @Test
+    @DisplayName("getStabilityValueTooltip returns tooltip for known values and null for unknown")
+    void stabilityTooltip_knownAndUnknown() {
+        assertNotNull(BpmConstants.getStabilityValueTooltip(BpmConstants.STABILITY_STABLE));
+        assertNotNull(BpmConstants.getStabilityValueTooltip(BpmConstants.STABILITY_MINOR_SHIFTS));
+        assertNotNull(BpmConstants.getStabilityValueTooltip(BpmConstants.STABILITY_UNSTABLE));
+        assertNull(BpmConstants.getStabilityValueTooltip(null));
+        assertNull(BpmConstants.getStabilityValueTooltip("Unknown"));
+    }
 }

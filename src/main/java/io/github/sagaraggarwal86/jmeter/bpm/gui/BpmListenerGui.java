@@ -63,6 +63,16 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
      */
     // CHANGED: Defect #2 — enables retroactive offset re-filtering by rebuilding aggregates from raw records
     private final List<BpmResult> allRawResults = new ArrayList<>();
+    /**
+     * UUID of the element currently displayed in the GUI. Used to save/restore results
+     * when navigating between BpmListener elements.
+     */
+    private String currentElementId;
+    /**
+     * Object reference of the element currently displayed. Used to detect element switches
+     * even when two elements share the same UUID (e.g., copy-paste in JMeter).
+     */
+    private TestElement currentElementRef;
     private JTextField filenameField;
     private JButton browseButton;          // CHANGED: field — needed to disable during test run (Feature #2)
     private JTextField startOffsetField;
@@ -243,6 +253,7 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
 
         updateTimer = new Timer(BpmConstants.GUI_UPDATE_INTERVAL_MS, e -> drainGuiQueue());
         updateTimer.setRepeats(true);
+        updateTimer.start();
     }
 
     private JPanel createFileFieldset() {
@@ -454,6 +465,16 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         element.setProperty(BpmConstants.TEST_ELEMENT_REGEX, regexCheckBox.isSelected());
         element.setProperty(BpmConstants.TEST_ELEMENT_INCLUDE, "Include".equals(includeExcludeCombo.getSelectedItem()));
         element.setProperty(BpmConstants.TEST_ELEMENT_CHART_INTERVAL, chartIntervalField.getText().trim());
+        // Persist column visibility so each listener retains its own selection across saves/loads.
+        if (columnSelector != null) {
+            boolean[] vis = columnSelector.getVisibility();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < vis.length; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(vis[i]);
+            }
+            element.setProperty(BpmConstants.TEST_ELEMENT_COLUMN_VISIBILITY, sb.toString());
+        }
     }
 
     @Override
@@ -482,41 +503,79 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                 // Without this, listenerRef stays null after pendingFreshClear, and the property is
                 // never written, causing isUserProvidedOutputPath() to return false at testStarted().
                 this.listenerRef = listener;
-                // CHANGED: Defect #1 (this session) — brand-new element created via createTestElement():
-                // clear the shared GUI so the user sees a blank slate, then return.
-                // Fields above were already set to empty/default (properties were stripped).
+
+                currentElementId = element.getPropertyAsString(BpmConstants.TEST_ELEMENT_ID, "");
+                currentElementRef = element;
+
                 if (pendingFreshClear) {
                     pendingFreshClear = false;
                     clearDisplayOnly();
                     return;
                 }
 
-                // Display data persists across Save, navigate-away/back, and test-start configure()
-                // calls. Only clearData() (user-initiated) or testStarted() (new run) clears it.
-                // Per-element primary lookup: find the initialized primary for THIS element.
+                tableModel.setTransactionFilter(
+                        transactionNamesField.getText().trim(),
+                        regexCheckBox.isSelected(),
+                        "Include".equals(includeExcludeCombo.getSelectedItem()));
+
+                // Always sync GUI with the element's authoritative data (Aggregate Report pattern).
                 String eid = BpmListener.buildElementKey(element);
                 BpmListener active = BpmListener.getPrimaryForElement(eid);
                 if (active != null && active.getGuiUpdateQueue() != null) {
-                    // Live test running for this element — wire to its primary.
                     this.listenerRef = active;
                     this.propertiesRef = active.getPropertiesManager();
-                    if (!updateTimer.isRunning()) {
-                        testRunning = true;
-                        updateTimer.start();
-                    }
+                    // Drain the queue BEFORE snapshotting rawResults to prevent double-counting.
+                    // sampleOccurred adds to rawResults first, then to queue. Both contain the
+                    // same items. Without draining, rebuildTableFromRaw would show rawResults data,
+                    // then drainGuiQueue would re-add the same items from the queue.
+                    ConcurrentLinkedQueue<BpmResult> q = active.getGuiUpdateQueue();
+                    while (q.poll() != null) { /* discard — rawResults already has them */ }
+                    allRawResults.clear();
+                    allRawResults.addAll(active.getRawResults());
+                    rebuildTableFromRaw();
+                    testRunning = true;
                 } else {
-                    // No active test — wire to element, leave display data intact.
                     this.listenerRef = listener;
                     this.propertiesRef = listener.getPropertiesManager();
+                    List<BpmResult> stored = listener.getRawResults();
+                    if (!stored.isEmpty()) {
+                        allRawResults.clear();
+                        allRawResults.addAll(stored);
+                        rebuildTableFromRaw();
+                    } else {
+                        allRawResults.clear();
+                        tableModel.clear();
+                        tableModel.fireTableDataChanged();
+                        resetScoreBox();
+                        testStartField.setText("");
+                        testEndField.setText("");
+                        testDurationField.setText("");
+                        testStartTime = null;
+                        saveTableDataButton.setEnabled(false);
+                        updateAiButtonState();
+                    }
                     if (testRunning) {
-                        // Guard: timer may have been started by a prior stale configure() call;
-                        // stop it now that we know no test is active.
                         testRunning = false;
-                        if (updateTimer.isRunning()) {
-                            updateTimer.stop();
-                        }
                         updateFilterFieldsEnabled();
                     }
+                }
+
+                // Restore column visibility from TestElement property.
+                String visProp = element.getPropertyAsString(
+                        BpmConstants.TEST_ELEMENT_COLUMN_VISIBILITY, "");
+                if (!visProp.isEmpty()) {
+                    String[] parts = visProp.split(",");
+                    // Default unspecified columns to their defaults (handles old .jmx
+                    // files saved with fewer columns than the current version).
+                    boolean[] vis = java.util.Arrays.copyOf(
+                            BpmConstants.RAW_COLUMNS_DEFAULT_VISIBILITY,
+                            BpmConstants.RAW_COLUMN_COUNT);
+                    for (int i = 0; i < vis.length && i < parts.length; i++) {
+                        vis[i] = Boolean.parseBoolean(parts[i].trim());
+                    }
+                    columnSelector.setVisibility(vis);
+                } else {
+                    columnSelector.resetToDefaults();
                 }
             }
         } finally {
@@ -527,30 +586,50 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
     @Override
     public void clearGui() {
         super.clearGui();
-        clearDisplayOnly();
-    }
-
-    @Override
-    public void removeNotify() {
-        if (updateTimer != null && updateTimer.isRunning()) {
-            updateTimer.stop();
-        }
-        super.removeNotify();
+        // Do NOT call clearDisplayOnly() here — JMeter calls clearGui() on every
+        // tree-node navigation.  Results data (allRawResults, table, score box,
+        // timestamps) must survive navigate-away/back.  Data is cleared by:
+        //   • clearData()   — user-initiated Clear / Clear All
+        //   • testStarted() — new test run
+        //   • pendingFreshClear in configure() — brand-new element creation
     }
 
     @Override
     public void clearData() {
-        // Called by JMeter "Clear" / "Clear All" — reset everything. // CHANGED: Feature #4
-        if (listenerRef != null) {
-            listenerRef.clearData();
+        // Clear data on ALL BpmListener GUI-tree elements (not just the displayed one)
+        // so that switching to another listener after Clear/Clear All shows empty data.
+        try {
+            var guiPackage = org.apache.jmeter.gui.GuiPackage.getInstance();
+            if (guiPackage != null) {
+                var nodes = guiPackage.getTreeModel().getNodesOfType(BpmListener.class);
+                for (var node : nodes) {
+                    if (node.getTestElement() instanceof BpmListener bl) {
+                        bl.clearData();
+                        // Reset filter properties so that configure() reads defaults
+                        // when the user switches to this (currently inactive) listener.
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_START_OFFSET, "");
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_END_OFFSET, "");
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_TRANSACTION_NAMES, "");
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_REGEX, false);
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_INCLUDE, true);
+                        bl.setProperty(BpmConstants.TEST_ELEMENT_CHART_INTERVAL, "0");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Fallback: clear only the active listener
+            if (listenerRef != null) {
+                listenerRef.clearData();
+            }
         }
         clearDisplayOnly();
     }
 
     /**
      * Resets only the GUI display without touching the backend listener state or any output file.
-     * Called only from {@link #clearData()} (user-initiated Clear/Clear All).
-     * Never called from {@code configure()} — display data must persist across Save and navigate events.
+     * Called from {@link #clearData()} (user-initiated Clear/Clear All) and from
+     * {@code configure()} when {@code pendingFreshClear} is set (brand-new element creation).
+     * Never called from {@link #clearGui()} — display data must persist across navigation.
      *
      * <p>Filter fields (start/end offset, transaction names, regex, include/exclude) are reset
      * to their defaults here. The reset is wrapped in a {@code configuringElement} guard to
@@ -580,8 +659,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         if (browseButton != null) {
             browseButton.setEnabled(true);
         }
-        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — table is empty after clear, so all filter fields disabled
-        // CHANGED: Defect #1 — reset filter fields; guard suppresses applyAllFilters() listeners
+        // Reset filter fields BEFORE disabling them so values are cleared while still enabled.
+        // Guard suppresses applyAllFilters() listeners fired by setSelected/setSelectedItem.
         configuringElement = true;
         try {
             startOffsetField.setText("");
@@ -593,34 +672,11 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         } finally {
             configuringElement = false;
         }
-        if (updateTimer != null && updateTimer.isRunning()) {
-            updateTimer.stop();
-        }
+        updateFilterFieldsEnabled();
     }
 
     private void drainGuiQueue() {
-        BpmListener listener = this.listenerRef;
-        if (listener == null) {
-            return;
-        }
-
-        // If listenerRef is the original (not the primary), its queue is null.
-        // Look up the primary for this element's key — the primary has the queue.
-        ConcurrentLinkedQueue<BpmResult> queue = listener.getGuiUpdateQueue();
-        if (queue == null) {
-            String elementKey = BpmListener.buildElementKey(listener);
-            BpmListener primary = BpmListener.getPrimaryForElement(elementKey);
-            if (primary != null) {
-                listener = primary;
-                queue = listener.getGuiUpdateQueue();
-            }
-        }
-        if (queue == null) {
-            return;
-        }
-
-        // CHANGED: Feature #1 — update End and Duration continuously every timer tick during live test,
-        // regardless of whether new records arrived. Gives real-time elapsed view without waiting for testEnded().
+        // Update elapsed time on every tick during a live test.
         if (testRunning && testStartTime != null) {
             Instant now = Instant.now();
             testEndField.setText(TIME_FMT.format(now));
@@ -629,41 +685,67 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                     elapsed.toHours(), elapsed.toMinutesPart(), elapsed.toSecondsPart()));
         }
 
-        List<BpmResult> batch = new ArrayList<>();
-        BpmResult result;
-        while ((result = queue.poll()) != null) {
-            batch.add(result);
-        }
-        if (batch.isEmpty()) {
+        BpmListener listener = this.listenerRef;
+        if (listener == null) {
             return;
         }
 
-        if (testStartTime == null) {
-            String ts = batch.get(0).timestamp();
-            if (ts != null) {
+        ConcurrentLinkedQueue<BpmResult> queue = listener.getGuiUpdateQueue();
+        if (queue == null) {
+            // Fallback: listenerRef may point to the tree element (queue=null) if
+            // testStarted() couldn't resolve the primary yet. Try a live lookup.
+            if (testRunning && currentElementRef instanceof BpmListener) {
+                String eid = BpmListener.buildElementKey(currentElementRef);
+                BpmListener active = BpmListener.getPrimaryForElement(eid);
+                if (active != null && active.getGuiUpdateQueue() != null) {
+                    this.listenerRef = active;
+                    this.propertiesRef = active.getPropertiesManager();
+                    queue = active.getGuiUpdateQueue();
+                }
+            }
+            if (queue == null) {
+                return;
+            }
+        }
+
+        // Drain queue and update table model directly — O(batch) per tick, not O(total).
+        BpmResult result;
+        boolean changed = false;
+        while ((result = queue.poll()) != null) {
+            tableModel.addOrUpdateResult(result);
+            changed = true;
+            if (testStartTime == null && result.timestamp() != null) {
                 try {
-                    testStartTime = Instant.parse(ts);
+                    testStartTime = Instant.parse(result.timestamp());
                     testStartField.setText(TIME_FMT.format(testStartTime));
                 } catch (Exception ignored) {
                 }
             }
         }
-
-        // CHANGED: Defect #2 — store all incoming records raw; offset filter applied in rebuild,
-        // not at ingest, so changing offset retroactively re-filters the entire dataset.
-        int remaining = BpmConstants.MAX_RAW_RESULTS - allRawResults.size();
-        if (remaining > 0) {
-            allRawResults.addAll(remaining >= batch.size() ? batch : batch.subList(0, remaining));
+        if (changed) {
+            tableModel.fireTableDataChanged();
+            updateScoreBox(listener);
         }
-        rebuildTableFromRaw();
-
-        updateScoreBox(listener);
     }
 
     public void testStarted() {
-        // Global check: suppress GUI clear when the user chose "Don't Start JMeter Engine".
         if (BpmListener.isDontStartPending()) {
             return;
+        }
+        // Guard: BpmListener.testStarted() calls this via invokeLater for EACH listener
+        // element (3 listeners = 3 calls). Only the first call does the real work.
+        if (testRunning) {
+            return;
+        }
+        // Update listenerRef to the active primary (execution-tree element) — the GUI
+        // tree element's transient fields are null; only the execution primary has them.
+        if (currentElementRef instanceof BpmListener) {
+            String eid = BpmListener.buildElementKey(currentElementRef);
+            BpmListener active = BpmListener.getPrimaryForElement(eid);
+            if (active != null) {
+                this.listenerRef = active;
+                this.propertiesRef = active.getPropertiesManager();
+            }
         }
         allRawResults.clear();
         tableModel.clear();
@@ -674,38 +756,42 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         testRunning = true;
         testStartTime = Instant.now();
         testStartField.setText(TIME_FMT.format(testStartTime));
-        // Disable file controls during test run // CHANGED: Feature #2 (prev session)
         filenameField.setEditable(false);
         browseButton.setEnabled(false);
         saveTableDataButton.setEnabled(false);
         updateAiButtonState();
-        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — disables start/end offset during test execution
-        if (!updateTimer.isRunning()) {
-            updateTimer.start();
-        }
+        updateFilterFieldsEnabled();
     }
 
     public void testEnded() {
-        boolean wasRunning = testRunning; // CHANGED: Defect #2 — capture before reset; false when DONT_START (testStarted never set it true)
+        // Guard: BpmListener.testEnded() calls this via invokeLater for EACH listener
+        // element (3 listeners = 3 calls). Only the first call does the real work;
+        // subsequent calls are no-ops since testRunning is already false.
+        if (!testRunning) {
+            return;
+        }
         testRunning = false;
-        // Only update time fields when the test actually ran; preserves loaded file timestamps on DONT_START
-        if (wasRunning) { // CHANGED: Defect #2
-            Instant endTime = Instant.now();
-            testEndField.setText(TIME_FMT.format(endTime));
-            if (testStartTime != null) {
-                Duration dur = Duration.between(testStartTime, endTime);
-                long h = dur.toHours();
-                long m = dur.toMinutesPart();
-                long s = dur.toSecondsPart();
-                testDurationField.setText(String.format("%dh %dm %ds", h, m, s));
+        Instant endTime = Instant.now();
+        testEndField.setText(TIME_FMT.format(endTime));
+        if (testStartTime != null) {
+            Duration dur = Duration.between(testStartTime, endTime);
+            testDurationField.setText(String.format("%dh %dm %ds",
+                    dur.toHours(), dur.toMinutesPart(), dur.toSecondsPart()));
+        }
+        // Final authoritative rebuild — picks up all samples including any
+        // that arrived after the last timer drain.
+        BpmListener listener = this.listenerRef;
+        if (listener != null) {
+            List<BpmResult> authoritative = listener.getRawResults();
+            if (!authoritative.isEmpty()) {
+                allRawResults.clear();
+                allRawResults.addAll(authoritative);
+                rebuildTableFromRaw();
             }
         }
-        updateTimer.stop();
-        drainGuiQueue();
-        // Re-enable file controls after test ends // CHANGED: Feature #2 (prev session)
         filenameField.setEditable(true);
         browseButton.setEnabled(true);
-        updateFilterFieldsEnabled(); // CHANGED: Feature #1 — replaces explicit startOffsetField.setEnabled(true) / endOffsetField.setEnabled(true)
+        updateFilterFieldsEnabled();
         saveTableDataButton.setEnabled(tableModel.getRowCount() > 0);
         refreshAiProviders();
         updateAiButtonState();
@@ -930,7 +1016,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
      *
      * <ul>
      *   <li>Offset fields — disabled during test execution (Feature #1); enabled otherwise.</li>
-     *   <li>Apply Filters — always enabled (Change #2).</li>
+     *   <li>Apply Filters — disabled during test execution; enabled otherwise.</li>
+     *   <li>Reload List — disabled during test execution; enabled otherwise.</li>
      *   <li>Transaction-names, regex, include/exclude — enabled when the table has data.</li>
      * </ul>
      */ // CHANGED: Feature #1; Change #1; Change #2; Defects #1 #2 #3
@@ -942,8 +1029,11 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         regexCheckBox.setEnabled(hasRows);
         includeExcludeCombo.setEnabled(hasRows);
         if (applyFiltersButton != null) {
-            applyFiltersButton.setEnabled(true);
-        } // CHANGED: Change #2 — always enabled
+            applyFiltersButton.setEnabled(hasRows);
+        }
+        if (reloadListButton != null) {
+            reloadListButton.setEnabled(!testRunning);
+        }
     }
 
     private void applyColumnVisibility() {
@@ -1058,6 +1148,10 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         if (rawResultsDirty) {
             rawResultsDirty = false;
             rebuildTableFromRaw();
+            // Persist file-loaded data into the listener so it survives element switches.
+            if (listenerRef != null) {
+                listenerRef.setRawResults(allRawResults);
+            }
         }
     }
 
@@ -1185,8 +1279,10 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         boolean txInclude = "Include".equals(includeExcludeCombo.getSelectedItem());
         java.util.regex.Pattern txPattern = null;
         if (!txFilter.isEmpty() && txRegex) {
-            try { txPattern = java.util.regex.Pattern.compile(txFilter, java.util.regex.Pattern.CASE_INSENSITIVE); }
-            catch (java.util.regex.PatternSyntaxException ignored) { }
+            try {
+                txPattern = java.util.regex.Pattern.compile(txFilter, java.util.regex.Pattern.CASE_INSENSITIVE);
+            } catch (java.util.regex.PatternSyntaxException ignored) {
+            }
         }
 
         List<TimeBucketBuilder.RawSample> rawSamples = new ArrayList<>();
@@ -1199,7 +1295,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                     long elapsedSec = Duration.between(testStartTime, Instant.parse(r.timestamp())).getSeconds();
                     if (startOffset > 0 && elapsedSec < startOffset) continue;
                     if (endOffset > 0 && elapsedSec > endOffset) continue;
-                } catch (Exception ignored) { }
+                } catch (Exception ignored) {
+                }
             }
             // Apply transaction name filter
             String label = r.samplerLabel();
@@ -1240,7 +1337,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
         int chartInterval = 0;
         try {
             chartInterval = Integer.parseInt(chartIntervalField.getText().trim());
-        } catch (NumberFormatException ignored) { }
+        } catch (NumberFormatException ignored) {
+        }
         TimeBucketBuilder.GroupedResult grouped = TimeBucketBuilder.buildGrouped(rawSamples, chartInterval);
 
         // Compute run date/time and duration
@@ -1277,7 +1375,8 @@ public class BpmListenerGui extends AbstractListenerGui implements Clearable {
                             String numStr = tgNode.getTestElement()
                                     .getPropertyAsString("ThreadGroup.num_threads", "0");
                             totalThreads += Integer.parseInt(numStr.trim());
-                        } catch (NumberFormatException ignored) { }
+                        } catch (NumberFormatException ignored) {
+                        }
                     }
                 }
                 if (totalThreads > 0) {
