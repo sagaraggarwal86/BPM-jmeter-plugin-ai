@@ -45,9 +45,19 @@ class MetricsBufferTest {
         MetricsBuffer buffer = new MetricsBuffer();
         buffer.addNetworkResponse(null);
         buffer.addConsoleMessage(null, null);
+        buffer.addConsoleMessage("error", null);
+        buffer.addConsoleMessage(null, "text");
 
         assertEquals(0, buffer.networkResponseCount());
         assertEquals(0, buffer.consoleMessageCount());
+    }
+
+    @Test
+    @DisplayName("Empty drain returns empty list, not null")
+    void emptyDrain_returnsEmptyList() {
+        MetricsBuffer buffer = new MetricsBuffer();
+        assertEquals(0, buffer.drainNetworkResponses().size());
+        assertEquals(0, buffer.drainConsoleMessages().size());
     }
 
     @Test

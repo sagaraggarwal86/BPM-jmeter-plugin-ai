@@ -397,7 +397,8 @@
                             </rules>
                             <!-- Classes outside Layer 1+2 coverage scope:
                                  gui/*           — Swing GUI requires JMeter GUI runtime
-                                 BpmListener     — collection paths require JMeter context + CDP
+                                 BpmListener     — passive consumer, requires JMeter context
+                                 BpmCollector    — CDP collection, requires JMeter context + CDP
                                  CdpSessionManager — requires live CDP sessions
                                  ChromeCdpCommandExecutor — requires Selenium/ChromeDriver -->
                             <excludes>
@@ -406,6 +407,7 @@
                                 <exclude>**/cli/**</exclude>
                                 <exclude>**/BpmListener.class</exclude>
                                 <exclude>**/BpmListener$*.class</exclude>
+                                <exclude>**/BpmCollector.class</exclude>
                                 <exclude>**/LabelAggregate.class</exclude>
                                 <exclude>**/FileOpenMode.class</exclude>
                                 <exclude>**/ChromeCdpCommandExecutor.class</exclude>

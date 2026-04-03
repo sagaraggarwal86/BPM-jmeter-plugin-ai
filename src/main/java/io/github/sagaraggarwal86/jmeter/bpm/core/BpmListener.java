@@ -1,15 +1,10 @@
 package io.github.sagaraggarwal86.jmeter.bpm.core;
 
-import io.github.sagaraggarwal86.jmeter.bpm.collectors.*;
 import io.github.sagaraggarwal86.jmeter.bpm.config.BpmPropertiesManager;
-import io.github.sagaraggarwal86.jmeter.bpm.error.BpmErrorHandler;
-import io.github.sagaraggarwal86.jmeter.bpm.error.LogOnceTracker;
-import io.github.sagaraggarwal86.jmeter.bpm.gui.BpmListenerGui; // CHANGED: §5.5 — GUI lifecycle wiring
+import io.github.sagaraggarwal86.jmeter.bpm.gui.BpmListenerGui;
 import io.github.sagaraggarwal86.jmeter.bpm.model.*;
 import io.github.sagaraggarwal86.jmeter.bpm.output.JsonlWriter;
 import io.github.sagaraggarwal86.jmeter.bpm.util.BpmConstants;
-import io.github.sagaraggarwal86.jmeter.bpm.util.BpmDebugLogger;
-import io.github.sagaraggarwal86.jmeter.bpm.util.ConsoleSanitizer;
 import org.apache.jmeter.samplers.Clearable;
 import org.apache.jmeter.samplers.SampleEvent;
 import org.apache.jmeter.samplers.SampleListener;
@@ -24,37 +19,37 @@ import javax.swing.*;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-
-// SummaryJsonWriter intentionally removed — Feature #1: summary JSON generation disabled
 
 /**
- * Main BPM listener — captures browser performance metrics from WebDriver Sampler
- * executions via Chrome DevTools Protocol.
+ * Main BPM listener — passive consumer of browser performance metrics.
  *
  * <p>Implements {@link SampleListener} (fires on every sampler), {@link TestStateListener}
  * (test lifecycle), and {@link Clearable} (Clear/Clear All support).</p>
  *
- * <h2>Lazy Selenium loading</h2>
- * <p>No Selenium types are imported directly. Selenium availability is checked once per
- * test via {@code Class.forName("org.openqa.selenium.chrome.ChromeDriver")}. If absent,
- * BPM operates as a no-op with an info-bar warning.</p>
+ * <h2>Collect-once, read-many</h2>
+ * <p>The actual CDP metric collection is delegated to a shared {@link BpmCollector} instance.
+ * Each {@code BpmListener} instance independently reads the collected {@link BpmResult} and
+ * writes to its <b>own</b> JSONL file and GUI queue. Multiple listeners never inflate metrics
+ * because the collector runs exactly once per sample per thread.</p>
  *
- * <h2>Thread safety</h2>
- * <ul>
- *   <li>{@link ConcurrentLinkedQueue} for GUI result updates</li>
- *   <li>{@link ConcurrentHashMap} for per-thread CDP executors and MetricsBuffers</li>
- *   <li>Atomic counters for health metrics</li>
- * </ul>
+ * <h2>Clone delegation</h2>
+ * <p>JMeter's {@code AbstractTestElement.clone()} creates new instances via the no-arg
+ * constructor — transient fields are NOT shared with the original. Per-thread clones
+ * have {@code testInitialized=false}, so {@link #sampleOccurred} delegates to the
+ * primary registered in {@link #primaryByName}. Only the primary owns mutable state
+ * (queue, rawResults, writer). All shared structures are thread-safe
+ * ({@link ConcurrentLinkedQueue}, {@link Collections#synchronizedList},
+ * {@link ConcurrentHashMap}).</p>
  *
  * <h2>Error handling</h2>
- * <p>All exceptions are caught, logged, and handled via {@link BpmErrorHandler}.
+ * <p>All exceptions are caught, logged, and handled via the collector's error handler.
  * No exception ever propagates to JMeter. The parent sampler result is never affected.</p>
  */
 public class BpmListener extends AbstractTestElement
@@ -63,31 +58,11 @@ public class BpmListener extends AbstractTestElement
     private static final long serialVersionUID = 1L;
     private static final Logger log = LoggerFactory.getLogger(BpmListener.class);
     /**
-     * Per-element-name primary-instance registry.
-     * Maps each distinct BpmListener element name to the first instance that won setup for it.
-     * Clones of the same element (name collision) skip setup and delegate sampleOccurred() to
-     * the registered primary. Cleared per-element in testEnded() so each run starts fresh.
-     *
-     * <p>Replaces the old global {@code AtomicBoolean testStartLock} which allowed only ONE
-     * BpmListener element per test plan to run setup — breaking the file-exists dialog when
-     * a later element had an existing user-provided path.</p>
-     */ // CHANGED: Defect — per-name primary registry replaces global testStartLock
+     * Active listener registry. Maps each distinct BpmListener element key to its instance.
+     * Used by the GUI to look up the running listener for a given element.
+     * Cleared per-element in testEnded() so each run starts fresh.
+     */
     private static final ConcurrentHashMap<String, BpmListener> primaryByName = new ConcurrentHashMap<>();
-    /**
-     * All active JSONL writers across all primaries. The primary that collects metrics writes
-     * the BpmResult to EVERY registered writer, so all output files contain the same data.
-     * This is necessary because only the first primary to encounter a thread opens the CDP
-     * session and populates its own executorsByThread — other primaries' maps remain empty.
-     */
-    private static final java.util.concurrent.CopyOnWriteArrayList<JsonlWriter> allJsonlWriters =
-            new java.util.concurrent.CopyOnWriteArrayList<>();
-    /**
-     * All active GUI update queues across all primaries. Results are broadcast to all queues
-     * so every BpmListenerGui instance shows the same live data regardless of which primary
-     * performed the actual metric collection.
-     */
-    private static final java.util.concurrent.CopyOnWriteArrayList<ConcurrentLinkedQueue<BpmResult>> allGuiQueues =
-            new java.util.concurrent.CopyOnWriteArrayList<>();
     /**
      * Pre-flight coordination: ensures the file-exists scan runs exactly once per test run.
      * The first BpmListener primary to call testStarted() wins the CAS and performs the scan
@@ -95,8 +70,6 @@ public class BpmListener extends AbstractTestElement
      * Reset in testEnded() when the last primary cleans up.
      */
     private static final AtomicBoolean preFlightDone = new AtomicBoolean(false);
-    // CHANGED: Static reference to the instance that received testStarted() — cloned instances
-    // that receive sampleOccurred() without testStarted() delegate to this active instance.
     private static volatile BpmListener activeInstance;
     /**
      * Global file-exists decision, set by the pre-flight scan.
@@ -109,47 +82,26 @@ public class BpmListener extends AbstractTestElement
      * True only when this instance completed a full {@link #testStarted(String)} (i.e. the test
      * actually started). False for DONT_START returns and for clones that never ran testStarted.
      * Guards {@link #testEnded(String)} so only the owner instance notifies the GUI.
-     */ // CHANGED: Defect #2
+     */
     private transient volatile boolean testActuallyStarted = false;
     /**
      * Engine reference cached at the very start of testStarted() for use in stopTestEngine().
-     */ // CHANGED: Defect #2
+     */
     private transient org.apache.jmeter.engine.JMeterEngine cachedEngine;
     private transient BpmPropertiesManager propertiesManager;
-    private transient BpmDebugLogger debugLogger;
     private transient JsonlWriter jsonlWriter;
 
     // ── Per-test state (reset in testStarted) ──────────────────────────────────────────────
-    // summaryJsonWriter removed — Feature #1: summary JSON generation disabled
-    private transient BpmErrorHandler errorHandler;
-    private transient LogOnceTracker logOnceTracker;
-    private transient CdpSessionManager sessionManager;
-    private transient ConsoleSanitizer consoleSanitizer;
-    // Collectors
-    private transient WebVitalsCollector webVitalsCollector;
-    private transient NetworkCollector networkCollector;
-    private transient RuntimeCollector runtimeCollector;
-    private transient ConsoleCollector consoleCollector;
-    private transient DerivedMetricsCalculator derivedCalculator;
-    // Per-thread CDP executors and buffers
-    private transient ConcurrentHashMap<String, CdpCommandExecutor> executorsByThread;
-    private transient ConcurrentHashMap<String, MetricsBuffer> buffersByThread;
-    /**
-     * Queue for GUI updates — drained by the 500ms Swing Timer in BpmListenerGui.
-     */
+
+    private transient volatile boolean testInitialized;
     private transient ConcurrentLinkedQueue<BpmResult> guiUpdateQueue;
-    // Health counters
-    private transient AtomicInteger samplesCollected;
-    private transient AtomicLong totalCollectionTimeMs;
-    // Per-label running aggregates for log summary and summary JSON
     private transient ConcurrentHashMap<String, LabelAggregate> labelAggregates;
-    // Selenium availability flag (checked once per test)
-    private transient volatile boolean seleniumAvailable;
-    private transient volatile boolean seleniumChecked;
-    // Info bar override for Scenario A/C states — read by BpmListenerGui.drainGuiQueue() // CHANGED: §5.7
-    private transient volatile String infoBarOverride;
-    // Per-thread iteration counter
-    private transient ConcurrentHashMap<String, AtomicInteger> iterationsByThread;
+    /**
+     * Authoritative raw results for this listener. Written by sampleOccurred() on JMeter
+     * threads, read by the GUI on EDT. The GUI reads from this list on element switch and
+     * at testEnded — no queue draining or per-element caching needed (Aggregate Report pattern).
+     */
+    private transient List<BpmResult> rawResults;
 
     /**
      * Returns true if the pre-flight scan resolved to DONT_START — the user chose
@@ -217,8 +169,8 @@ public class BpmListener extends AbstractTestElement
     // ── TestStateListener ──────────────────────────────────────────────────────────────────
 
     /**
-     * Called when the test starts. Initializes all state, loads configuration,
-     * opens the JSONL writer, and resets health counters.
+     * Called when the test starts. Initializes own JSONL writer and GUI queue,
+     * and acquires the shared {@link BpmCollector}.
      */
     @Override
     public void testStarted() {
@@ -230,21 +182,17 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testStarted(String host) {
-        // Build composite key: UUID + output path. This ensures copied elements (same UUID,
-        // different output paths) are treated as distinct, while thread-group clones (same
-        // UUID AND same path) correctly share the primary slot.
         String elementKey = buildElementKey();
 
-        // If the global pre-flight already decided DONT_START, skip everything.
         if (globalFileDecision == FileOpenMode.DONT_START) {
             return;
         }
-        // Per-element primary: first call for a key wins; clones skip.
+        // First call for a key wins; JMeter clones with the same key skip setup.
         if (primaryByName.putIfAbsent(elementKey, this) != null) {
-            log.debug("BPM: testStarted() — clone instance skipped for key '{}'", elementKey);
+            log.debug("BPM: testStarted() — clone skipped for key '{}'", elementKey);
             return;
         }
-        log.debug("BPM: testStarted() — this instance is primary for key '{}'", elementKey);
+        log.debug("BPM: testStarted() — registered for key '{}'", elementKey);
 
         testActuallyStarted = false;
 
@@ -252,11 +200,7 @@ public class BpmListener extends AbstractTestElement
         cachedEngine = org.apache.jmeter.threads.JMeterContextService.getContext().getEngine();
 
         // ── Pre-flight file-exists scan (runs exactly once per test run) ──────────────
-        // The first primary to win the CAS scans ALL enabled BpmListener elements in the
-        // test plan. If any user-provided output file exists, a single dialog is shown.
-        // The decision is stored in globalFileDecision for all subsequent primaries.
         if (preFlightDone.compareAndSet(false, true)) {
-            // Need propertiesManager for -J flag check during scan
             propertiesManager = new BpmPropertiesManager();
             propertiesManager.load();
 
@@ -271,80 +215,40 @@ public class BpmListener extends AbstractTestElement
                     stopTestEngine(cachedEngine);
                     return;
                 }
-                // OVERWRITE: fall through to normal setup
             } else {
                 globalFileDecision = FileOpenMode.OVERWRITE;
             }
         }
 
-        // If another primary's pre-flight resolved to DONT_START while we waited
         if (globalFileDecision == FileOpenMode.DONT_START) {
             primaryByName.remove(elementKey);
             return;
         }
 
-        // Load configuration (first primary already loaded propertiesManager above;
-        // subsequent primaries load their own copy)
+        // Load configuration
         if (propertiesManager == null) {
             propertiesManager = new BpmPropertiesManager();
             propertiesManager.load();
         }
 
-        debugLogger = new BpmDebugLogger(propertiesManager.isDebugEnabled());
-        logOnceTracker = new LogOnceTracker();
-        errorHandler = new BpmErrorHandler(logOnceTracker);
-        sessionManager = new CdpSessionManager();
-        consoleSanitizer = new ConsoleSanitizer(propertiesManager.isSanitizeEnabled());
-
-        // Initialize collectors
-        webVitalsCollector = new WebVitalsCollector();
-        webVitalsCollector.reset();
-        networkCollector = new NetworkCollector(propertiesManager.getNetworkTopN());
-        runtimeCollector = new RuntimeCollector();
-        runtimeCollector.reset();
-        consoleCollector = new ConsoleCollector(consoleSanitizer);
-        derivedCalculator = new DerivedMetricsCalculator(propertiesManager);
-
-        // Initialize writers
+        // Initialize own JSONL writer
         jsonlWriter = new JsonlWriter();
-
         String outputPath = resolveOutputPath();
         try {
             Path outputFile = Path.of(outputPath);
-            jsonlWriter.open(outputFile); // always overwrite (TRUNCATE_EXISTING)
+            jsonlWriter.open(outputFile);
             log.info("BPM: JSONL output file opened (overwrite): {}", outputPath);
         } catch (IOException e) {
             log.warn("BPM: Failed to open JSONL output file: {}. JSONL writing disabled.", outputPath, e);
         }
 
-        // Initialize per-thread state
-        executorsByThread = new ConcurrentHashMap<>();
-        buffersByThread = new ConcurrentHashMap<>();
         guiUpdateQueue = new ConcurrentLinkedQueue<>();
         labelAggregates = new ConcurrentHashMap<>();
-        iterationsByThread = new ConcurrentHashMap<>();
+        rawResults = Collections.synchronizedList(new ArrayList<>());
+        testInitialized = true;
 
-        // Register this primary's writer and GUI queue for broadcast writes.
-        // The primary that actually collects metrics writes to ALL registered writers/queues.
-        // Only register if the writer actually opened successfully — a failed writer would
-        // generate per-record log warnings under load.
-        if (jsonlWriter != null && jsonlWriter.isOpen()) {
-            allJsonlWriters.add(jsonlWriter);
-        }
-        allGuiQueues.add(guiUpdateQueue);
+        BpmCollector.acquire(propertiesManager);
 
-        // Health counters
-        samplesCollected = new AtomicInteger(0);
-        totalCollectionTimeMs = new AtomicLong(0);
-
-        // Selenium check deferred to first sampleOccurred
-        seleniumAvailable = false;
-        seleniumChecked = false;
-        infoBarOverride = null;
-
-        debugLogger.log("Test started. Debug mode: {}", propertiesManager.isDebugEnabled());
-
-        // Notify GUI of test start if running in GUI mode.
         try {
             BpmListenerGui gui = BpmListenerGui.getActiveGui();
             if (gui != null) {
@@ -363,80 +267,62 @@ public class BpmListener extends AbstractTestElement
     /**
      * Called for every sampler execution in the Thread Group.
      *
-     * <p>Decision tree:</p>
-     * <ol>
-     *   <li>Is {@code BPM_DevTools} in vars? → collect metrics</li>
-     *   <li>Is {@code Browser} in vars and instanceof ChromeDriver? → init CDP session</li>
-     *   <li>Otherwise → skip (not a WebDriver thread or non-Chrome)</li>
-     * </ol>
+     * <p>Delegates metric collection to the shared {@link BpmCollector} (collect-once-read-many),
+     * then writes the result to this listener's own JSONL file and GUI queue.</p>
      */
     @Override
     public void sampleOccurred(SampleEvent event) {
-        // CHANGED: Defect — delegate to this element's primary instance (not the global activeInstance).
-        // JMeter may invoke sampleOccurred on a cloned BpmListener that never received testStarted().
-        // The clone forwards the event to the primary instance that owns the writers, collectors,
-        // and GUI-connected queue for this specific element name.
-        if (errorHandler == null) {
-            String elementKey = buildElementKey();
-            BpmListener primary = primaryByName.get(elementKey);
-            if (primary != null && primary != this) {
+        // Clone delegation: JMeter's AbstractTestElement.clone() creates new instances
+        // via the no-arg constructor — transient fields (testInitialized, guiUpdateQueue,
+        // rawResults, jsonlWriter) are NOT shared with the original. Per-thread clones
+        // must delegate to the primary that ran testStarted().
+        if (!testInitialized) {
+            BpmListener primary = primaryByName.get(buildElementKey());
+            if (primary != null && primary != this && primary.testInitialized) {
                 primary.sampleOccurred(event);
             }
             return;
         }
         try {
             SampleResult result = event.getResult();
-            var ctx = org.apache.jmeter.threads.JMeterContextService.getContext(); // CHANGED: safe context guard (§2.1)
+            var ctx = org.apache.jmeter.threads.JMeterContextService.getContext();
             JMeterVariables vars = ctx != null ? ctx.getVariables() : null;
 
             if (vars == null) {
                 return;
             }
 
-            String threadName = Thread.currentThread().getName(); // CHANGED: full thread name e.g. "Thread Group 1-1" (§4.2)
-
-            // Check if thread is disabled by error handler
-            if (errorHandler.isThreadDisabled(threadName)) {
+            BpmCollector collector = BpmCollector.getInstance();
+            if (collector == null) {
                 return;
             }
 
-            // Check for existing CDP session
-            Object devToolsObj = vars.getObject(BpmConstants.VAR_BPM_DEV_TOOLS);
-            if (devToolsObj != null) {
-                // CDP session exists — collect metrics
-                collectMetrics(threadName, result, vars);
+            BpmResult bpmResult = collector.collectIfNeeded(vars, result);
+            if (bpmResult == null) {
                 return;
             }
 
-            // No CDP session — try to initialize
-            Object browserObj = vars.getObject(BpmConstants.VAR_BROWSER);
-            if (browserObj == null) {
-                // Not a WebDriver thread — skip silently
-                return;
+            if (jsonlWriter != null && jsonlWriter.isOpen()) {
+                jsonlWriter.write(bpmResult);
             }
 
-            // Lazy Selenium check (once per test)
-            if (!seleniumChecked) {
-                checkSeleniumAvailability(threadName);
-            }
-            if (!seleniumAvailable) {
-                return;
-            }
-
-            // Check if it's a Chrome/Chromium driver
-            if (!isChromeDriver(browserObj, threadName)) {
-                return;
+            if (rawResults != null) {
+                synchronized (rawResults) {
+                    if (rawResults.size() < BpmConstants.MAX_RAW_RESULTS) {
+                        rawResults.add(bpmResult);
+                    }
+                }
             }
 
-            // Initialize CDP session for this thread
-            initCdpSession(browserObj, threadName, vars);
+            if (guiUpdateQueue != null) {
+                guiUpdateQueue.offer(bpmResult);
+            }
+
+            updateLabelAggregate(bpmResult.samplerLabel(), bpmResult.derived(),
+                    bpmResult.webVitals(), bpmResult.network(), bpmResult.console());
 
         } catch (Exception e) {
-            // Never let exceptions propagate to JMeter
             log.warn("BPM: Unexpected error in sampleOccurred", e);
-            if (debugLogger != null) { // CHANGED: null-guard — debugLogger is transient; may be null if testStarted() was never called
-                debugLogger.log("sampleOccurred exception: {}", e.toString());
-            }
         }
     }
 
@@ -459,8 +345,8 @@ public class BpmListener extends AbstractTestElement
     // ── TestStateListener (end) ────────────────────────────────────────────────────────────
 
     /**
-     * Called when the test ends. Flushes writers, writes summary, prints log summary,
-     * and closes all CDP sessions.
+     * Called when the test ends. Flushes own JSONL writer, prints log summary,
+     * and releases the shared {@link BpmCollector}.
      */
     @Override
     public void testEnded() {
@@ -472,46 +358,29 @@ public class BpmListener extends AbstractTestElement
      */
     @Override
     public void testEnded(String host) {
-        // Remove this element's entry so the next run gets a fresh slot
         String elementKey = buildElementKey();
         primaryByName.remove(elementKey);
 
-        // Reset pre-flight state when the last primary exits, so the next run starts fresh.
         if (primaryByName.isEmpty()) {
             preFlightDone.set(false);
             globalFileDecision = null;
         }
 
-        // If this instance never fully started (DONT_START or clone),
-        // skip all cleanup and GUI notification to preserve the displayed file data
         if (!testActuallyStarted) {
             log.debug("BPM: testEnded() on instance that never fully started — skipping.");
             return;
         }
 
-        // Deregister this primary's writer and queue from the broadcast lists.
-        if (jsonlWriter != null) {
-            allJsonlWriters.remove(jsonlWriter);
-        }
-        if (guiUpdateQueue != null) {
-            allGuiQueues.remove(guiUpdateQueue);
-        }
-
         try {
-            // Flush and close JSONL
+            // Flush and close own JSONL
             if (jsonlWriter != null) {
                 jsonlWriter.flush();
             }
 
-            // Summary JSON intentionally skipped — Feature #1: generation disabled
-
-            // Print log summary
+            // Print own log summary
             printLogSummary();
 
-            // Close all CDP sessions
-            closeAllCdpSessions();
-
-            // Final close of JSONL writer
+            // Final close of own JSONL writer
             if (jsonlWriter != null) {
                 jsonlWriter.close();
             }
@@ -520,10 +389,28 @@ public class BpmListener extends AbstractTestElement
             log.warn("BPM: Error during testEnded", e);
         }
 
-        if (debugLogger != null) { // CHANGED: null-guard — testEnded() may be called without testStarted()
-            debugLogger.log("Test ended. Total samples collected: {}",
-                    samplesCollected != null ? samplesCollected.get() : 0);
+        // Persist rawResults to the corresponding GUI-tree element so the GUI's
+        // configure() finds data after the test ends. The execution tree (this) is a
+        // separate copy from the GUI tree — configure() receives GUI-tree elements.
+        try {
+            var guiPackage = org.apache.jmeter.gui.GuiPackage.getInstance();
+            if (guiPackage != null && rawResults != null) {
+                String thisKey = buildElementKey();
+                var nodes = guiPackage.getTreeModel().getNodesOfType(BpmListener.class);
+                for (var node : nodes) {
+                    if (node.getTestElement() instanceof BpmListener guiElement
+                            && thisKey.equals(buildElementKey(guiElement))) {
+                        guiElement.setRawResults(getRawResults());
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("BPM: Failed to persist rawResults to GUI tree: {}", e.getMessage());
         }
+
+        // Release shared collector (last listener destroys it, closing all CDP sessions)
+        BpmCollector.release();
 
         // Notify GUI of test end if running in GUI mode.
         try {
@@ -535,9 +422,11 @@ public class BpmListener extends AbstractTestElement
             // Non-GUI mode — no GUI to notify
         }
 
-        if (activeInstance == this) { // CHANGED: clear static reference to allow GC and prevent stale delegation
+        if (activeInstance == this) {
             activeInstance = null;
         }
+
+        testInitialized = false;
     }
 
     // ── Clearable ──────────────────────────────────────────────────────────────────────────
@@ -554,17 +443,38 @@ public class BpmListener extends AbstractTestElement
         if (guiUpdateQueue != null) {
             guiUpdateQueue.clear();
         }
-        if (samplesCollected != null) {
-            samplesCollected.set(0);
+        if (rawResults != null) {
+            rawResults.clear();
         }
-        if (totalCollectionTimeMs != null) {
-            totalCollectionTimeMs.set(0);
-        }
-        // Note: GUI component reset (table model, score box, filters) is handled
-        // by BpmListenerGui.clearData() which calls this method and then resets its own state.
     }
 
     // ── GUI integration ────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns a snapshot of all raw results collected by this listener.
+     * Thread-safe — the backing list is synchronized.
+     *
+     * @return a copy of the raw results, or an empty list if none
+     */
+    public List<BpmResult> getRawResults() {
+        if (rawResults == null) {
+            return Collections.emptyList();
+        }
+        synchronized (rawResults) {
+            return new ArrayList<>(rawResults);
+        }
+    }
+
+    /**
+     * Replaces this listener's raw results with the given list.
+     * Used by the GUI to persist file-loaded data into the listener so it
+     * survives element switches (Aggregate Report pattern: data lives in the element).
+     *
+     * @param results the results to store; a defensive copy is made
+     */
+    public void setRawResults(List<BpmResult> results) {
+        rawResults = Collections.synchronizedList(new ArrayList<>(results));
+    }
 
     /**
      * Returns the GUI update queue for draining by the Swing Timer.
@@ -586,22 +496,27 @@ public class BpmListener extends AbstractTestElement
 
     /**
      * Returns the properties manager for GUI access to SLA thresholds.
+     * Proxies to the shared {@link BpmCollector} if available, falls back to own instance.
      *
      * @return the properties manager, or null if test has not started
      */
     public BpmPropertiesManager getPropertiesManager() {
+        BpmCollector collector = BpmCollector.getInstance();
+        if (collector != null) {
+            return collector.getPropertiesManager();
+        }
         return propertiesManager;
     }
 
     /**
      * Returns an info-bar override message set during Scenario A (no Selenium) or
-     * Scenario C (non-Chrome browser). Null if no override is active.
-     * Read by BpmListenerGui.drainGuiQueue() on the EDT.
+     * Scenario C (non-Chrome browser). Proxies to the shared {@link BpmCollector}.
      *
-     * @return info-bar override text, or null // CHANGED: §5.7
+     * @return info-bar override text, or null
      */
-    public String getInfoBarOverride() { // CHANGED: §5.7
-        return infoBarOverride;
+    public String getInfoBarOverride() {
+        BpmCollector collector = BpmCollector.getInstance();
+        return collector != null ? collector.getInfoBarOverride() : null;
     }
 
     // ── Internal: Output path resolution ──────────────────────────────────────────────────
@@ -610,7 +525,7 @@ public class BpmListener extends AbstractTestElement
      * Resolves the effective JSONL output file path, applying priority:
      * {@code -Jbpm.output (highest) → GUI TestElement property → bpm.properties/default (lowest)}.
      */
-    private String resolveOutputPath() { // CHANGED: restored missing Javadoc opening
+    private String resolveOutputPath() {
         // 1. -J flag (CLI override — highest priority)
         String jFlag = propertiesManager.getJMeterProperty(BpmConstants.PROP_BPM_OUTPUT);
         if (jFlag != null && !jFlag.isBlank()) {
@@ -627,32 +542,23 @@ public class BpmListener extends AbstractTestElement
 
     /**
      * Scans all enabled BpmListener elements in the test plan for existing output files.
-     * In GUI mode, traverses the test plan tree via {@code GuiPackage}. In CLI mode, returns
-     * an empty list (CLI always overwrites silently).
-     *
-     * <p>Also checks the {@code -Jbpm.output} flag — if set, it overrides all per-element paths
-     * and only that single path is checked.</p>
-     *
-     * @return list of existing output file paths (user-provided only); empty if no conflicts
      */
     private java.util.List<Path> scanForConflictingFiles() {
         java.util.List<Path> conflicts = new java.util.ArrayList<>();
 
-        // Check -J flag first (applies globally, overrides all per-element paths)
         String jFlag = propertiesManager.getJMeterProperty(BpmConstants.PROP_BPM_OUTPUT);
         if (jFlag != null && !jFlag.isBlank()) {
             Path p = Path.of(jFlag);
             if (Files.exists(p)) {
                 conflicts.add(p);
             }
-            return conflicts; // -J overrides all per-element paths — no need to scan further
+            return conflicts;
         }
 
-        // GUI mode: scan all enabled BpmListener elements in the test plan
         try {
             org.apache.jmeter.gui.GuiPackage guiPackage = org.apache.jmeter.gui.GuiPackage.getInstance();
             if (guiPackage == null) {
-                return conflicts; // CLI mode — always overwrite silently
+                return conflicts;
             }
 
             var treeModel = guiPackage.getTreeModel();
@@ -663,7 +569,7 @@ public class BpmListener extends AbstractTestElement
                 if (!node.isEnabled()) continue;
                 org.apache.jmeter.testelement.TestElement element = node.getTestElement();
                 String guiPath = element.getPropertyAsString(BpmConstants.TEST_ELEMENT_OUTPUT_PATH, "").trim();
-                if (guiPath.isEmpty()) continue; // default path — not user-provided, skip
+                if (guiPath.isEmpty()) continue;
                 Path p = Path.of(guiPath);
                 if (Files.exists(p) && !conflicts.contains(p)) {
                     conflicts.add(p);
@@ -679,12 +585,6 @@ public class BpmListener extends AbstractTestElement
     /**
      * Shows a single dialog listing all conflicting output files and asks the user
      * whether to overwrite all or stop the engine.
-     *
-     * <p>In CLI mode (no GuiPackage): always returns {@link FileOpenMode#OVERWRITE}.</p>
-     * <p>In GUI mode: blocks via {@code SwingUtilities.invokeAndWait} until the user responds.</p>
-     *
-     * @param conflictingFiles list of existing output files (must not be empty)
-     * @return the chosen open mode; never null
      */
     private FileOpenMode resolveFileOpenMode(java.util.List<Path> conflictingFiles) {
         try {
@@ -696,13 +596,11 @@ public class BpmListener extends AbstractTestElement
             return FileOpenMode.OVERWRITE;
         }
 
-        // Build the file list for the dialog message
         StringBuilder fileList = new StringBuilder();
         for (Path p : conflictingFiles) {
             fileList.append("  \u2022 ").append(p).append("\n");
         }
 
-        // GUI mode — ask the user on the EDT, block until answered
         int[] choice = {JOptionPane.CLOSED_OPTION};
         try {
             String[] options = {"Overwrite", "Don't Start JMeter Engine"};
@@ -735,15 +633,8 @@ public class BpmListener extends AbstractTestElement
 
     /**
      * Requests an immediate test stop via the JMeter engine.
-     * Uses the engine reference cached at the top of {@link #testStarted(String)} (obtained on
-     * the engine thread before the dialog blocked it). Falls back to the GUI ActionRouter so that
-     * even if the context reference is unavailable the test can still be stopped.
-     *
-     * @param engine the cached engine reference; may be null, in which case only the ActionRouter
-     *               fallback is attempted
-     */ // CHANGED: Defect #2 — accepts pre-cached engine; adds ActionRouter fallback
+     */
     private void stopTestEngine(org.apache.jmeter.engine.JMeterEngine engine) {
-        // Primary: stop via cached engine reference (synchronous — prevents threads from starting)
         if (engine != null) {
             try {
                 engine.stopTest(true);
@@ -754,7 +645,6 @@ public class BpmListener extends AbstractTestElement
         } else {
             log.warn("BPM: Cached engine reference is null — relying on ActionRouter fallback.");
         }
-        // Fallback: GUI ActionRouter (equivalent to pressing Stop in JMeter UI)
         try {
             if (org.apache.jmeter.gui.GuiPackage.getInstance() != null) {
                 javax.swing.SwingUtilities.invokeLater(() -> {
@@ -770,241 +660,6 @@ public class BpmListener extends AbstractTestElement
             }
         } catch (Exception e) {
             log.warn("BPM: Could not access ActionRouter: {}", e.getMessage());
-        }
-    }
-
-    // ── Internal: Selenium check ───────────────────────────────────────────────────────────
-
-    /**
-     * Checks Selenium availability via Class.forName. Called once per test.
-     */
-    private synchronized void checkSeleniumAvailability(String threadName) {
-        if (seleniumChecked) {
-            return;
-        }
-        seleniumChecked = true;
-        try {
-            Class.forName("org.openqa.selenium.chrome.ChromeDriver");
-            seleniumAvailable = true;
-            debugLogger.log("Selenium/ChromeDriver found on classpath.");
-        } catch (ClassNotFoundException e) {
-            seleniumAvailable = false;
-            infoBarOverride = BpmConstants.INFO_NO_SELENIUM; // CHANGED: §5.7 — Scenario A info bar
-            log.warn("BPM: {}", BpmConstants.INFO_NO_SELENIUM);
-        }
-    }
-
-    /**
-     * Checks if the browser object is a ChromeDriver (without importing Selenium).
-     * Uses class name string comparison to avoid ClassNotFoundException.
-     */
-    private boolean isChromeDriver(Object browserObj, String threadName) {
-        String className = browserObj.getClass().getName();
-        // Match ChromeDriver or any ChromiumDriver subclass
-        if (className.contains("ChromeDriver") || className.contains("ChromiumDriver")) {
-            return true;
-        }
-        logOnceTracker.warnOnce(threadName, "non-chrome",
-                "Non-Chrome browser detected (" + className + "). CDP metrics require Chrome/Chromium.");
-        infoBarOverride = BpmConstants.INFO_NON_CHROME; // CHANGED: §5.7 — Scenario C info bar
-        return false;
-    }
-
-    // ── Internal: CDP session init ─────────────────────────────────────────────────────────
-
-    /**
-     * Initializes a CDP session for the given thread's browser.
-     */
-    private void initCdpSession(Object browserObj, String threadName, JMeterVariables vars) {
-        long startMs = System.currentTimeMillis();
-        try {
-            // Create executor via factory (no Selenium imports needed in BpmListener)
-            CdpCommandExecutor executor = ChromeCdpCommandExecutor.fromBrowserObject(browserObj);
-
-            // Create per-thread buffer
-            MetricsBuffer buffer = new MetricsBuffer();
-
-            // Open CDP session (enable domains, inject observers)
-            sessionManager.openSession(executor);
-
-            // Store in per-thread maps
-            executorsByThread.put(threadName, executor);
-            buffersByThread.put(threadName, buffer);
-
-            // Store marker in JMeterVariables for subsequent sampleOccurred checks
-            vars.putObject(BpmConstants.VAR_BPM_DEV_TOOLS, executor);
-            vars.putObject(BpmConstants.VAR_BPM_EVENT_BUFFER, buffer);
-
-            long durationMs = System.currentTimeMillis() - startMs;
-            debugLogger.logCdpSessionOpened(threadName, durationMs);
-
-        } catch (Exception e) {
-            logOnceTracker.warnOnce(threadName, "cdp-init-failed",
-                    "Failed to initialize CDP session: " + e.getMessage());
-            errorHandler.handleSessionError(threadName, e);
-        }
-    }
-
-    // ── Internal: Metric collection ────────────────────────────────────────────────────────
-
-    /**
-     * Collects all enabled metrics, computes derived metrics, writes JSONL, and queues for GUI.
-     */
-    private void collectMetrics(String threadName, SampleResult sampleResult, JMeterVariables vars) {
-        CdpCommandExecutor executor = executorsByThread.get(threadName);
-        MetricsBuffer buffer = buffersByThread.get(threadName);
-
-        if (executor == null || buffer == null) {
-            return;
-        }
-
-        // Check if re-init is needed
-        if (errorHandler.needsReInit(threadName)) {
-            attemptReInit(threadName, vars);
-            executor = executorsByThread.get(threadName);
-            buffer = buffersByThread.get(threadName);
-            if (executor == null || errorHandler.isThreadDisabled(threadName)) {
-                return;
-            }
-        }
-
-        long collectionStart = System.currentTimeMillis();
-
-        try {
-            // Transfer browser-side buffered events to Java-side MetricsBuffer
-            sessionManager.transferBufferedEvents(executor, buffer);
-
-            // Re-inject observers if page navigation destroyed the JavaScript context. // CHANGED: post-navigation observer re-injection
-            // Returns true if a navigation was detected — used to reset per-thread delta baselines.
-            boolean navigated = sessionManager.ensureObserversInjected(executor); // CHANGED: per-action accuracy
-            if (navigated) { // CHANGED: per-action accuracy — reset collector baselines so deltas start fresh on new page
-                webVitalsCollector.resetThreadState(threadName);
-                runtimeCollector.resetThreadState(threadName);
-            }
-
-            // Collect raw metrics per enabled tier
-            long t0, vitalsMs = 0, networkMs = 0, runtimeMs = 0, consoleMs = 0;
-
-            WebVitalsResult vitals = null;
-            if (propertiesManager.isWebVitalsEnabled()) {
-                t0 = System.currentTimeMillis();
-                vitals = webVitalsCollector.collect(executor, buffer);
-                vitalsMs = System.currentTimeMillis() - t0;
-            }
-
-            NetworkResult network = null;
-            if (propertiesManager.isNetworkEnabled()) {
-                t0 = System.currentTimeMillis();
-                network = networkCollector.collect(executor, buffer);
-                networkMs = System.currentTimeMillis() - t0;
-                debugLogger.logNetworkBufferDrained(network != null ? network.totalRequests() : 0); // CHANGED: P5 — call site was missing; method existed in BpmDebugLogger but was never invoked
-            }
-
-            RuntimeResult runtime = null;
-            if (propertiesManager.isRuntimeEnabled()) {
-                t0 = System.currentTimeMillis();
-                runtime = runtimeCollector.collect(executor, buffer);
-                runtimeMs = System.currentTimeMillis() - t0;
-            }
-
-            ConsoleResult console = null;
-            if (propertiesManager.isConsoleEnabled()) {
-                t0 = System.currentTimeMillis();
-                console = consoleCollector.collect(executor, buffer);
-                consoleMs = System.currentTimeMillis() - t0;
-            }
-
-            debugLogger.logCollection(sampleResult.getSampleLabel(),
-                    vitalsMs, networkMs, runtimeMs, consoleMs);
-
-            // Compute derived metrics
-            DerivedMetrics derived = derivedCalculator.compute(
-                    vitals, network, runtime, console, sampleResult.getTime());
-
-            debugLogger.logDerivedMetrics(sampleResult.getSampleLabel(),
-                    derived.performanceScore(), derived.improvementArea());
-
-            // Build BpmResult
-            int iteration = iterationsByThread
-                    .computeIfAbsent(threadName, k -> new AtomicInteger(0))
-                    .incrementAndGet();
-
-            BpmResult bpmResult = new BpmResult(
-                    BpmConstants.SCHEMA_VERSION,
-                    Instant.now().toString(),
-                    threadName,
-                    iteration,
-                    sampleResult.getSampleLabel(),
-                    sampleResult.isSuccessful(),
-                    sampleResult.getTime(),
-                    vitals,
-                    network,
-                    runtime,
-                    console,
-                    derived
-            );
-
-            // Broadcast write to ALL registered JSONL writers (one per BpmListener element).
-            // Only the primary that owns the CDP session collects metrics, but all output
-            // files must contain the same data.
-            long writeStart = System.currentTimeMillis();
-            for (JsonlWriter w : allJsonlWriters) {
-                w.write(bpmResult);
-            }
-            debugLogger.logJsonlWrite(1, 0, System.currentTimeMillis() - writeStart);
-
-            // Broadcast to ALL registered GUI queues so every listener's GUI shows live data.
-            for (ConcurrentLinkedQueue<BpmResult> q : allGuiQueues) {
-                q.offer(bpmResult);
-            }
-
-            // Update label aggregates
-            updateLabelAggregate(sampleResult.getSampleLabel(), derived, vitals, network, console);
-
-            // Update health counters
-            samplesCollected.incrementAndGet();
-            totalCollectionTimeMs.addAndGet(System.currentTimeMillis() - collectionStart);
-
-        } catch (Exception e) {
-            errorHandler.handleCollectionError(threadName, e);
-            debugLogger.log("Collection error for thread '{}': {}", threadName, e.getMessage());
-        }
-    }
-
-    /**
-     * Attempts to re-initialize the CDP session for a thread.
-     */
-    private void attemptReInit(String threadName, JMeterVariables vars) {
-        debugLogger.logCdpReInit(threadName, 1);
-        try {
-            // Close old executor
-            CdpCommandExecutor oldExecutor = executorsByThread.remove(threadName);
-            if (oldExecutor != null) {
-                sessionManager.closeSession(oldExecutor);
-            }
-
-            // Get browser from vars and re-init
-            Object browserObj = vars.getObject(BpmConstants.VAR_BROWSER);
-            if (browserObj == null || !isChromeDriver(browserObj, threadName)) {
-                errorHandler.handleSessionError(threadName,
-                        new RuntimeException("Browser not available for re-init"));
-                return;
-            }
-
-            CdpCommandExecutor newExecutor = ChromeCdpCommandExecutor.fromBrowserObject(browserObj);
-            MetricsBuffer newBuffer = new MetricsBuffer();
-
-            sessionManager.reInjectObservers(newExecutor); // CHANGED: Gap 1 — use reInjectObservers (not openSession) to reset CLS accumulator and prevent double-counting
-
-            executorsByThread.put(threadName, newExecutor);
-            buffersByThread.put(threadName, newBuffer);
-            vars.putObject(BpmConstants.VAR_BPM_DEV_TOOLS, newExecutor);
-            vars.putObject(BpmConstants.VAR_BPM_EVENT_BUFFER, newBuffer);
-
-            errorHandler.markReInitSuccess(threadName);
-
-        } catch (Exception e) {
-            errorHandler.handleSessionError(threadName, e);
         }
     }
 
@@ -1024,26 +679,21 @@ public class BpmListener extends AbstractTestElement
     // ── Internal: Summary generation ───────────────────────────────────────────────────────
 
     /**
-     * Writes the bpm-summary.json file from label aggregates.
-     */
-    // writeSummaryJson() removed — Feature #1: summary JSON generation disabled
-
-    /**
      * Prints the log summary table per design doc section 4.4.
      */
     private void printLogSummary() {
         if (labelAggregates == null || labelAggregates.isEmpty()) {
-            log.info("BPM: No samples collected.");
+            log.debug("BPM: No samples collected (non-CDP primary or empty run).");
             return;
         }
 
         log.info("=============== BPM Summary ===============");
         log.info(String.format("%-15s | %7s | %5s | %8s | %7s | %7s | %s",
-                "Label", "Samples", "Score", "Rndr(ms)", "Srvr(%)", "Gap(ms)", "Bottleneck"));
+                "Label", "Samples", "Score", "Rndr(ms)", "Srvr(%)", "Gap(ms)", "Improvement"));
 
         int totalSamples = 0;
         long totalWeightedScore = 0;
-        int totalScoredSamples = 0; // CHANGED: per-action accuracy — only count samples with non-null score
+        int totalScoredSamples = 0;
         long totalWeightedRender = 0;
         double totalWeightedRatio = 0;
         long totalWeightedGap = 0;
@@ -1051,19 +701,20 @@ public class BpmListener extends AbstractTestElement
         for (Map.Entry<String, LabelAggregate> entry : labelAggregates.entrySet()) {
             LabelAggregate agg = entry.getValue();
             int samples = agg.getSampleCount();
-            Integer score = agg.getAverageScore(); // CHANGED: per-action accuracy — nullable
-            String scoreStr = score != null ? String.valueOf(score) : "—"; // CHANGED: per-action accuracy
+            Integer score = agg.getAverageScore();
+            String scoreStr = score != null ? String.valueOf(score) : "\u2014";
             long renderTime = agg.getAverageRenderTime();
             double serverRatio = agg.getAverageServerRatio();
             long fcpLcpGap = agg.getAverageFcpLcpGap();
-            String improvementArea = agg.getPrimaryImprovementArea(); // CHANGED: renamed
+            String improvementArea = agg.getPrimaryImprovementArea();
+            String improvementDisplay = BpmConstants.BOTTLENECK_NONE.equals(improvementArea) ? "-" : improvementArea;
 
             log.info(String.format("%-15s | %7d | %5s | %8d | %6.2f%% | %7d | %s",
                     truncateLabel(entry.getKey()), samples, scoreStr, renderTime,
-                    serverRatio, fcpLcpGap, improvementArea)); // CHANGED: renamed
+                    serverRatio, fcpLcpGap, improvementDisplay));
 
             totalSamples += samples;
-            if (score != null) { // CHANGED: per-action accuracy — only aggregate non-null scores
+            if (score != null) {
                 totalWeightedScore += (long) score * samples;
                 totalScoredSamples += samples;
             }
@@ -1073,12 +724,12 @@ public class BpmListener extends AbstractTestElement
         }
 
         if (totalSamples > 0) {
-            String totalScoreStr = totalScoredSamples > 0 // CHANGED: per-action accuracy
+            String totalScoreStr = totalScoredSamples > 0
                     ? String.valueOf((int) (totalWeightedScore / totalScoredSamples))
-                    : "—";
+                    : "\u2014";
             log.info(String.format("%-15s | %7d | %5s | %8d | %6.2f%% | %7d |",
                     "TOTAL", totalSamples,
-                    totalScoreStr, // CHANGED: per-action accuracy
+                    totalScoreStr,
                     totalWeightedRender / totalSamples,
                     totalWeightedRatio / totalSamples,
                     totalWeightedGap / totalSamples));
@@ -1090,27 +741,16 @@ public class BpmListener extends AbstractTestElement
             log.info("BPM results written to: {}", jsonlWriter.getOutputPath());
         }
 
-        long avgCollectionTime = samplesCollected.get() > 0
-                ? totalCollectionTimeMs.get() / samplesCollected.get()
-                : 0;
-        log.info("BPM: Health — {} samples collected, {} failures, avg collection time {}ms, CDP re-inits: {}",
-                samplesCollected.get(),
-                errorHandler.getFailureCount(),
-                avgCollectionTime,
-                errorHandler.getReInitCount());
-    }
-
-    /**
-     * Closes all CDP sessions across all threads.
-     */
-    private void closeAllCdpSessions() {
-        if (executorsByThread == null) {
-            return;
+        BpmCollector collector = BpmCollector.getInstance();
+        if (collector != null) {
+            long avgCollectionTime = collector.getSamplesCollected() > 0
+                    ? collector.getTotalCollectionTimeMs() / collector.getSamplesCollected()
+                    : 0;
+            log.info("BPM: Health — {} samples collected, {} failures, avg collection time {}ms, CDP re-inits: {}",
+                    collector.getSamplesCollected(),
+                    collector.getErrorHandler().getFailureCount(),
+                    avgCollectionTime,
+                    collector.getErrorHandler().getReInitCount());
         }
-        for (Map.Entry<String, CdpCommandExecutor> entry : executorsByThread.entrySet()) {
-            sessionManager.closeSession(entry.getValue());
-        }
-        executorsByThread.clear();
-        buffersByThread.clear();
     }
 }

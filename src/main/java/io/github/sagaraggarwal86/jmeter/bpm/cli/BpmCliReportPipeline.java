@@ -341,7 +341,7 @@ public final class BpmCliReportPipeline {
      * Adds a TOTAL row at the end.
      */
     private static List<String[]> buildMetricsTable(Map<String, BpmTableModel.RowData> metricsRows,
-                                                     Map<String, LabelAggregate> filteredAggregates) {
+                                                    Map<String, LabelAggregate> filteredAggregates) {
         List<String[]> table = new ArrayList<>();
         table.add(BpmConstants.ALL_COLUMN_HEADERS);
 

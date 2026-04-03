@@ -40,9 +40,335 @@ public final class BpmHtmlReportRenderer {
             DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final DateTimeFormatter FOOTER_TIME_FMT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final String[] SLA_HEADER_TOOLTIPS = {
+            "Transaction/sampler name",
+            "Performance score (0-100). Higher is better",
+            "Largest Contentful Paint \u2014 time until main content is visible. Lower is better",
+            "First Contentful Paint \u2014 time until first text/image appears. Lower is better",
+            "Time To First Byte \u2014 server processing + network latency. Lower is better",
+            "Cumulative Layout Shift \u2014 measures unexpected content movement. Lower is better"
+    };
+    // Unit suffixes for SLA value display: index 0=Page (unused), 1=Score, 2=LCP, 3=FCP, 4=TTFB, 5=CLS
+    private static final String[] SLA_UNITS = {"", "", "ms", "ms", "ms", ""};
+    private static final String[] CF_HEADERS = {
+            "Transaction Name", "Severity", "Issue", "Root Cause", "User Impact", "Recommended Action"
+    };
+    private static final String[] CF_HEADER_TOOLTIPS = {
+            "Transaction/sampler name",
+            "Critical (any POOR verdict) or Warning (NEEDS_WORK only)",
+            "Which metrics breach SLA thresholds",
+            "Primary bottleneck driving the issue",
+            "What end users experience as a result",
+            "Specific action to resolve the issue"
+    };
+    // Root-cause diagnosis keyed by improvementArea (what's wrong)
+    private static final Map<String, String> ROOT_CAUSE_MAP = Map.of(
+            "Fix Network Failures", "Failed or blocked network requests",
+            "Reduce Server Response", "Backend processing bottleneck",
+            "Optimise Heavy Assets", "Large resources blocking render",
+            "Reduce Render Work", "Client-side rendering overhead",
+            "Reduce DOM Complexity", "Excessive DOM node count",
+            "None", "No single bottleneck identified"
+    );
+    // Recommended action keyed by improvementArea (what to do)
+    private static final Map<String, String> ACTION_MAP = Map.of(
+            "Fix Network Failures", "Check DevTools Network tab for 4xx/5xx errors. Verify CDN and third-party resource availability.",
+            "Reduce Server Response", "Profile backend response time. Check database queries, API calls, and caching headers via DevTools Timing tab.",
+            "Optimise Heavy Assets", "Identify largest resources via DevTools Network tab (sort by Size). Compress images (WebP/AVIF), lazy-load below-fold content.",
+            "Reduce Render Work", "Profile main thread in DevTools Performance tab. Look for long JavaScript tasks (>50ms) blocking rendering.",
+            "Reduce DOM Complexity", "Check DOM node count in DevTools Elements panel. Reduce nested elements and virtualize long lists.",
+            "None", "Monitor for regression"
+    );
+
+    // ── Heading extraction ──────────────────────────────────────────────────
+    // User impact templates keyed by which metric is worst
+    private static final Map<String, String> IMPACT_TEMPLATES = Map.of(
+            "LCP", "Users wait %sms before main content appears",
+            "FCP", "Users see a blank screen for %sms before first paint",
+            "TTFB", "Users wait %sms for server to begin responding",
+            "CLS", "Users experience unexpected layout shifts (CLS %s)",
+            "Score", "Overall degraded experience (Score %s)"
+    );
+    // Metric names in same order as verdicts/values arrays: Score, LCP, FCP, TTFB, CLS
+    private static final String[] IMPACT_METRIC_NAMES = {"Score", "LCP", "FCP", "TTFB", "CLS"};
+
+    // ── Page assembly ───────────────────────────────────────────────────────
+    private static final String[] METRICS_HEADER_TOOLTIPS = {
+            "Transaction/sampler name",
+            "Number of samples collected",
+            "Performance score (0-100). Higher is better",
+            "Render Time \u2014 client-side rendering duration (LCP \u2212 TTFB)",
+            "Server Ratio \u2014 percentage of load time spent on server response",
+            "Frontend Time \u2014 browser processing time (FCP \u2212 TTFB)",
+            "FCP-LCP Gap \u2014 delay between first paint and largest content",
+            "Layout stability category based on CLS",
+            "Percentage of SLA budget remaining before breach",
+            "Pre-computed bottleneck classification",
+            "First Contentful Paint \u2014 time until first text/image appears",
+            "Largest Contentful Paint \u2014 time until main content is visible",
+            "Cumulative Layout Shift \u2014 measures unexpected content movement",
+            "Time To First Byte \u2014 server processing + network latency",
+            "Average network requests per sample",
+            "Average transfer size per sample",
+            "Total JavaScript errors",
+            "Total console warnings"
+    };
+
+    // ── Header ──────────────────────────────────────────────────────────────
+    private static final Map<String, String> IMPROVEMENT_AREA_TOOLTIPS = Map.of(
+            "Fix Network Failures", "Check failed requests in DevTools Network tab (filter by status 4xx/5xx). Verify CDN and third-party resource availability.",
+            "Reduce Server Response", "Profile backend response time. Check database queries, API calls, and caching headers via DevTools Timing tab.",
+            "Optimise Heavy Assets", "Identify largest resources via DevTools Network tab (sort by Size). Compress images (WebP/AVIF), lazy-load below-fold content.",
+            "Reduce Render Work", "Profile main thread in DevTools Performance tab. Look for long JavaScript tasks (>50ms) blocking rendering.",
+            "Reduce DOM Complexity", "Check DOM node count in DevTools (Elements panel). Reduce nested elements and virtualize long lists.",
+            "None", "Performance is balanced \u2014 no single bottleneck identified."
+    );
+
+    // ── Sidebar ─────────────────────────────────────────────────────────────
+    private static final String CSS = """
+              <style>
+                :root {
+                  --color-text-primary:         #1a202c;
+                  --color-text-secondary:       #4a5568;
+                  --color-text-tertiary:        #718096;
+                  --color-background-primary:   #ffffff;
+                  --color-background-secondary: #f7fafc;
+                  --color-background-tertiary:  #f0f4f8;
+                  --color-border-secondary:     #cbd5e0;
+                  --color-border-tertiary:      #e2e8f0;
+                  --color-pass:                 #38a169;
+                  --color-warning:              #d69e2e;
+                  --color-fail:                 #e53e3e;
+                }
+                *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+                html, body { height: 100%; }
+                .rpt {
+                  font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px;
+                  line-height: 1.7; color: var(--color-text-primary);
+                  background: var(--color-background-tertiary);
+                  display: flex; flex-direction: column; min-height: 100vh;
+                }
+            
+                /* ── Header ────────────────────────────────────────────────── */
+                .rpt-header {
+                  background: #1a365d;
+                  color: white; padding: 24px 32px;
+                  display: flex; align-items: flex-start; justify-content: space-between;
+                  gap: 24px; flex-shrink: 0;
+                }
+                .header-left { flex: 1; min-width: 0; }
+                .rpt-header h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; color: white; }
+                .sub { font-size: 12px; color: rgba(255,255,255,0.7); margin-bottom: 8px; }
+                .meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 2px 16px; font-size: 12px; }
+                .ml { color: rgba(255,255,255,0.6); font-weight: 500; white-space: nowrap; }
+                .mv { color: white; }
+                .header-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; padding-top: 4px; }
+                .exp-btn {
+                  width: 148px; padding: 7px 0;
+                  border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
+                  cursor: pointer; border-radius: 5px; font-size: 13px; font-family: inherit;
+                  color: white; white-space: nowrap; line-height: 1.3; text-align: center;
+                  transition: background 0.15s;
+                }
+                .exp-btn:hover { background: rgba(255,255,255,0.22); }
+            
+                /* ── Layout ─────────────────────────────────────────────────── */
+                .body-row { display: flex; align-items: stretch; flex: 1; }
+                .sidebar {
+                  width: 210px; flex-shrink: 0; background: #f0f4f8;
+                  border-right: 1px solid #cbd5e0; padding: 12px 0;
+                  position: sticky; top: 0; align-self: flex-start;
+                  height: 100vh; overflow-y: auto;
+                }
+                .nav-item {
+                  display: block; width: 100%; padding: 10px 20px; border: none;
+                  background: transparent; text-align: left; font-size: 13px;
+                  font-family: inherit; color: #4a5568; cursor: pointer;
+                  line-height: 1.4; border-left: 3px solid transparent;
+                  transition: all 0.12s;
+                }
+                .nav-item:hover  { background: #e2e8f0; color: #2d3748; }
+                .nav-item.active { background: #fff; color: #1a365d; font-weight: 600; border-left: 3px solid #1a365d; }
+                .main-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+                .content-area { flex: 1; padding: 28px 32px; background: var(--color-background-primary); overflow: auto; }
+                .panel       { display: none; }
+                .panel.active { display: block; }
+            
+                /* ── Typography ─────────────────────────────────────────────── */
+                h2 {
+                  font-size: 16px; font-weight: 600; color: var(--color-text-primary);
+                  border-left: 3px solid #3182ce; padding-left: 11px; margin: 0 0 16px;
+                }
+                h3 {
+                  font-size: 14px; font-weight: 600; color: #2d3748; margin: 20px 0 8px;
+                  padding-bottom: 6px; border-bottom: 1px solid var(--color-border-tertiary);
+                }
+                p  { margin-bottom: 12px; font-size: 13px; color: var(--color-text-primary); }
+                code { background: #edf2f7; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 12px; color: #c53030; }
+                pre  { background: #2d3748; color: #e2e8f0; padding: 14px 18px; border-radius: 6px; overflow-x: auto; margin: 12px 0 18px; }
+                pre code { background: none; color: inherit; padding: 0; }
+                blockquote { border-left: 4px solid #63b3ed; margin: 14px 0; padding: 10px 16px; background: #ebf8ff; border-radius: 0 6px 6px 0; font-size: 13px; }
+                strong { font-weight: 700; }
+            
+                /* ── Tables ──────────────────────────────────────────────────── */
+                .tbl-wrap { overflow-x: auto; margin: 12px 0 20px; border-radius: 6px; border: 0.5px solid var(--color-border-secondary); }
+                table { border-collapse: collapse; width: 100%; background: var(--color-background-primary); font-size: 12px; }
+                th {
+                  background: #2d3748; color: white; padding: 8px 12px;
+                  text-align: left; font-size: 11px; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: 0.4px; white-space: nowrap;
+                  position: sticky; top: 0; z-index: 1;
+                }
+                td { padding: 7px 12px; border-bottom: 0.5px solid var(--color-border-tertiary); white-space: nowrap; }
+                td.sla-pass, span.sla-pass { text-align: center; font-weight: 600; color: #276749; }
+                td.sla-fail, span.sla-fail { text-align: center; font-weight: 700; color: #c53030; }
+                td.sla-warn, span.sla-warn { text-align: center; font-weight: 600; color: #b7791f; }
+                td.sla-na   { text-align: center; color: #a0aec0; }
+                td.num { text-align: right; font-variant-numeric: tabular-nums; }
+                tr:last-child td  { border-bottom: none; }
+                tr:nth-child(even) td { background: var(--color-background-secondary); }
+                tr.total-row td { font-weight: 700; background: #edf2f7; border-top: 2px solid var(--color-border-secondary); }
+                td.label-cell { font-weight: 500; }
+                .tbl-controls { margin-bottom: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; }
+                .tbl-controls select { padding: 3px 6px; border: 1px solid var(--color-border-secondary); border-radius: 4px; font-size: 12px; font-family: inherit; }
+                .tbl-scroll { overflow-y: auto; overflow-x: auto; }
+                th.sort-asc::after { content: ' \\25B2'; font-size: 9px; }
+                th.sort-desc::after { content: ' \\25BC'; font-size: 9px; }
+                th:hover { background: #4a5568; }
+                .pager { margin: 8px 0; font-size: 12px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+                .pg-btn {
+                  padding: 3px 8px; border: 1px solid var(--color-border-secondary); border-radius: 3px;
+                  background: var(--color-background-primary); cursor: pointer; font-size: 11px; font-family: inherit;
+                }
+                .pg-btn:hover:not(:disabled) { background: #e2e8f0; }
+                .pg-btn:disabled { opacity: 0.4; cursor: default; }
+                .pg-active { background: #1a365d; color: white; border-color: #1a365d; }
+                .pg-active:hover { background: #2a4365; }
+                .pg-info { font-size: 11px; color: var(--color-text-tertiary); margin-left: 8px; }
+                [data-table-id="cf"] td,
+                [data-table-id="recs"] td { white-space: normal; }
+                [data-table-id="cf"] td:nth-child(1),
+                [data-table-id="cf"] td:nth-child(2),
+                [data-table-id="recs"] td:nth-child(1),
+                [data-table-id="recs"] td:nth-child(3) { white-space: nowrap; }
+                [data-table-id="cf"] .tbl-scroll,
+                [data-table-id="recs"] .tbl-scroll { max-height: 520px; }
+                .sla-summary { font-size: 13px; margin-bottom: 12px; font-weight: 500; }
+                .sla-pass-summary { color: #276749; }
+                .sla-fail-summary { color: #c53030; }
+                .metric-desc { margin-top: 20px; padding: 14px 16px; background: var(--color-background-secondary); border: 1px solid var(--color-border-tertiary); border-radius: 6px; }
+                .metric-desc h3 { font-size: 12px; margin: 0 0 8px; border: none; padding: 0; }
+                .metric-desc dl { font-size: 12px; margin: 0; }
+                .metric-desc dt { font-weight: 600; color: var(--color-text-primary); margin-top: 6px; }
+                .metric-desc dd { color: var(--color-text-secondary); margin-left: 0; margin-bottom: 2px; }
+                .sla-thresholds { margin-top: 14px; font-size: 11px; color: var(--color-text-tertiary); line-height: 1.6; }
+                .tbl-search { margin-bottom: 10px; }
+                .tbl-search input {
+                  padding: 6px 10px; border: 1px solid var(--color-border-secondary); border-radius: 4px;
+                  font-size: 12px; font-family: inherit; width: 260px;
+                  transition: border-color 0.15s;
+                }
+                .tbl-search input:focus { outline: none; border-color: #3182ce; box-shadow: 0 0 0 2px rgba(49,130,206,0.15); }
+            
+                /* ── Lists ──────────────────────────────────────────────────── */
+                ul, ol { margin: 8px 0 14px 22px; font-size: 13px; }
+                li { margin-bottom: 5px; }
+                li strong { color: #2d3748; }
+            
+                /* ── Executive Summary: actionable finding cards ─────────────── */
+                .panel ul { list-style: none; margin-left: 0; padding: 0; }
+                .panel ul li {
+                  background: var(--color-background-secondary);
+                  border: 1px solid var(--color-border-tertiary);
+                  border-left: 4px solid #2b6cb0;
+                  border-radius: 0 6px 6px 0;
+                  padding: 10px 14px; margin-bottom: 10px;
+                }
+                .panel ol { list-style: decimal; margin-left: 22px; }
+                .panel ol li {
+                  background: transparent; border: none; border-left: none;
+                  border-radius: 0; padding: 0; margin-bottom: 5px;
+                }
+            
+                /* ── Critical Findings: severity-colored cards ──────────────── */
+                .panel h3 + ul { margin-top: 0; }
+                .panel h3 + ul li {
+                  border-left-color: var(--color-warning);
+                }
+            
+                /* ── KPI Cards (first panel) ────────────────────────────────── */
+                .metadata-grid.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-bottom: 24px; }
+                .kpi {
+                  background: var(--color-background-secondary); border-radius: 8px;
+                  padding: 14px 16px; border: 1px solid var(--color-border-tertiary);
+                  transition: box-shadow 0.15s;
+                }
+                .kpi:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+                .kpi-label { font-size: 10px; color: var(--color-text-secondary); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+                .kpi-value { font-size: 20px; font-weight: 500; color: var(--color-text-primary); line-height: 1.2; }
+                .kpi-value.pass { color: #276749; font-weight: 700; }
+                .kpi-value.fail { color: #c53030; font-weight: 700; }
+            
+                /* ── Charts ─────────────────────────────────────────────────── */
+                .charts-section  { margin: 0; }
+                .charts-note { font-size: 11px; color: var(--color-text-tertiary); margin-bottom: 12px; }
+                .chart-filter { margin-bottom: 16px; font-size: 13px; }
+                .chart-filter select { padding: 4px 8px; border: 1px solid var(--color-border-secondary); border-radius: 4px; font-size: 12px; font-family: inherit; }
+                .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 4px; }
+                .chart-box {
+                  background: var(--color-background-secondary); border: 1px solid var(--color-border-tertiary);
+                  border-radius: 8px; padding: 16px 18px 12px;
+                  transition: box-shadow 0.15s;
+                }
+                .chart-box:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+                .chart-box h3 { font-size: 12px; font-weight: 600; color: var(--color-text-secondary); margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.4px; border: none; padding: 0; }
+                .chart-canvas-wrap { position: relative; height: 220px; }
+            
+                /* ── Footer ─────────────────────────────────────────────────── */
+                .footer-rpt {
+                  font-size: 11px; color: var(--color-text-tertiary); padding: 12px 32px;
+                  border-top: 1px solid var(--color-border-tertiary);
+                  background: var(--color-background-primary); flex-shrink: 0;
+                }
+            
+                /* ── Responsive ─────────────────────────────────────────────── */
+                @media (max-width: 768px) {
+                  .sidebar { display: none; }
+                  .content-area { padding: 16px; }
+                  .rpt-header { flex-direction: column; padding: 16px; }
+                  .charts-grid { grid-template-columns: 1fr; }
+                }
+            
+                /* ── Print / PDF ────────────────────────────────────────────── */
+                @media print {
+                  .sidebar { display: none !important; }
+                  .body-row { display: block; }
+                  .main-col { display: block; }
+                  .panel { display: block !important; page-break-inside: avoid; margin-bottom: 24px; }
+                  .rpt-header { background: #1a365d !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+                  .header-actions { display: none; }
+                  .tbl-search { display: none; }
+                  .tbl-controls { display: none; }
+                  .chart-filter { display: none; }
+                  .tbl-scroll { max-height: none !important; overflow: visible !important; }
+                  .content-area { padding: 16px; overflow: visible; }
+                  .rpt { min-height: auto; }
+                  .footer-rpt { position: relative; }
+                  table { font-size: 10px; }
+                  th, td { padding: 4px 8px; }
+                  .charts-grid { grid-template-columns: 1fr; }
+                  .chart-canvas-wrap { height: 180px; }
+                  canvas { max-width: 100%; }
+                }
+              </style>
+            """;
+
+    // ── Metadata KPI cards (first panel) ────────────────────────────────────
 
     private BpmHtmlReportRenderer() {
     }
+
+    // ── Metrics table panel ────────────────────────────────────────────────
 
     /**
      * Simple overload for GUI mode (no metadata, no charts).
@@ -51,6 +377,8 @@ public final class BpmHtmlReportRenderer {
         return render(markdown, new RenderConfig(providerName, "", "", ""),
                 Collections.emptyList(), Collections.emptyMap());
     }
+
+    // ── SLA Compliance panel ────────────────────────────────────────────────
 
     /**
      * Overload with config but no charts.
@@ -129,7 +457,7 @@ public final class BpmHtmlReportRenderer {
                 hasMetrics, metricsTable, hasCharts, timeBuckets, perLabelBuckets);
     }
 
-    // ── Heading extraction ──────────────────────────────────────────────────
+    // ── Critical Findings panel (Java-generated) ─────────────────────────────
 
     private static List<String> extractH2Headings(String html) {
         List<String> headings = new ArrayList<>();
@@ -182,8 +510,6 @@ public final class BpmHtmlReportRenderer {
 
         return panels;
     }
-
-    // ── Page assembly ───────────────────────────────────────────────────────
 
     private static String buildHtmlPage(List<String[]> panels, List<String> panelHeadings,
                                         RenderConfig config,
@@ -272,8 +598,6 @@ public final class BpmHtmlReportRenderer {
         return sb.toString();
     }
 
-    // ── Header ──────────────────────────────────────────────────────────────
-
     private static void appendHeader(StringBuilder sb, RenderConfig config) {
         sb.append("  <div class=\"rpt-header\">\n    <div class=\"header-left\">\n");
         sb.append("      <h1>Browser Performance Metrics Report</h1>\n");
@@ -305,8 +629,6 @@ public final class BpmHtmlReportRenderer {
         sb.append("  </div>\n");
     }
 
-    // ── Sidebar ─────────────────────────────────────────────────────────────
-
     private static void appendSidebar(StringBuilder sb, List<String> panelHeadings) {
         sb.append("    <nav class=\"sidebar\">\n");
         for (int i = 0; i < panelHeadings.size(); i++) {
@@ -318,8 +640,6 @@ public final class BpmHtmlReportRenderer {
         sb.append("    </nav>\n");
     }
 
-    // ── Metadata KPI cards (first panel) ────────────────────────────────────
-
     private static void appendMetadataKpi(StringBuilder sb, RenderConfig config) {
         // KPI cards are now analytics-only; metadata moved to header meta-grid.
         // Actual values are populated by the AI markdown content.
@@ -328,32 +648,16 @@ public final class BpmHtmlReportRenderer {
         sb.append("    </div>\n");
     }
 
-    // ── Metrics table panel ────────────────────────────────────────────────
-
     private static void appendMetricsPanel(StringBuilder sb, RenderConfig config,
-                                            List<String[]> metricsTable) {
+                                           List<String[]> metricsTable) {
         sb.append("<h2>Performance Metrics</h2>\n");
         sb.append("<div class=\"tbl-search\"><input type=\"text\" id=\"metricsSearch\" ")
                 .append("placeholder=\"Search transactions\u2026\" autocomplete=\"off\"></div>\n");
         appendPaginatedTable(sb, config, metricsTable, "metrics");
     }
 
-    // ── SLA Compliance panel ────────────────────────────────────────────────
-
-    private static final String[] SLA_HEADER_TOOLTIPS = {
-            "Transaction/sampler name",
-            "Performance score (0-100). Higher is better",
-            "Largest Contentful Paint \u2014 time until main content is visible. Lower is better",
-            "First Contentful Paint \u2014 time until first text/image appears. Lower is better",
-            "Time To First Byte \u2014 server processing + network latency. Lower is better",
-            "Cumulative Layout Shift \u2014 measures unexpected content movement. Lower is better"
-    };
-
-    // Unit suffixes for SLA value display: index 0=Page (unused), 1=Score, 2=LCP, 3=FCP, 4=TTFB, 5=CLS
-    private static final String[] SLA_UNITS = {"", "", "ms", "ms", "ms", ""};
-
     private static void appendSlaPanel(StringBuilder sb, RenderConfig config,
-                                        List<String[]> metricsTable) {
+                                       List<String[]> metricsTable) {
         sb.append("<h2>SLA Compliance</h2>\n");
         sb.append("<div class=\"tbl-search\"><input type=\"text\" id=\"slaSearch\" ")
                 .append("placeholder=\"Search transactions\u2026\" autocomplete=\"off\"></div>\n");
@@ -431,10 +735,22 @@ public final class BpmHtmlReportRenderer {
                 String displayVerdict;
                 String css;
                 switch (verdict) {
-                    case "GOOD" -> { displayVerdict = "Pass"; css = "sla-pass"; }
-                    case "NEEDS_WORK" -> { displayVerdict = "Warning"; css = "sla-warn"; }
-                    case "POOR" -> { displayVerdict = "Fail"; css = "sla-fail"; }
-                    default -> { displayVerdict = null; css = "sla-na"; }
+                    case "GOOD" -> {
+                        displayVerdict = "Pass";
+                        css = "sla-pass";
+                    }
+                    case "NEEDS_WORK" -> {
+                        displayVerdict = "Warning";
+                        css = "sla-warn";
+                    }
+                    case "POOR" -> {
+                        displayVerdict = "Fail";
+                        css = "sla-fail";
+                    }
+                    default -> {
+                        displayVerdict = null;
+                        css = "sla-na";
+                    }
                 }
                 String display;
                 if (displayVerdict == null) {
@@ -498,51 +814,8 @@ public final class BpmHtmlReportRenderer {
         }
     }
 
-    // ── Critical Findings panel (Java-generated) ─────────────────────────────
-
-    private static final String[] CF_HEADERS = {
-            "Transaction Name", "Severity", "Issue", "Root Cause", "User Impact", "Recommended Action"
-    };
-    private static final String[] CF_HEADER_TOOLTIPS = {
-            "Transaction/sampler name",
-            "Critical (any POOR verdict) or Warning (NEEDS_WORK only)",
-            "Which metrics breach SLA thresholds",
-            "Primary bottleneck driving the issue",
-            "What end users experience as a result",
-            "Specific action to resolve the issue"
-    };
-
-    // Root-cause diagnosis keyed by improvementArea (what's wrong)
-    private static final Map<String, String> ROOT_CAUSE_MAP = Map.of(
-            "Fix Network Failures", "Failed or blocked network requests",
-            "Reduce Server Response", "Backend processing bottleneck",
-            "Optimise Heavy Assets", "Large resources blocking render",
-            "Reduce Render Work", "Client-side rendering overhead",
-            "Reduce DOM Complexity", "Excessive DOM node count",
-            "None", "No single bottleneck identified"
-    );
-
-    // Recommended action keyed by improvementArea (what to do)
-    private static final Map<String, String> ACTION_MAP = Map.of(
-            "Fix Network Failures", "Check DevTools Network tab for 4xx/5xx errors. Verify CDN and third-party resource availability.",
-            "Reduce Server Response", "Profile backend response time. Check database queries, API calls, and caching headers via DevTools Timing tab.",
-            "Optimise Heavy Assets", "Identify largest resources via DevTools Network tab (sort by Size). Compress images (WebP/AVIF), lazy-load below-fold content.",
-            "Reduce Render Work", "Profile main thread in DevTools Performance tab. Look for long JavaScript tasks (>50ms) blocking rendering.",
-            "Reduce DOM Complexity", "Check DOM node count in DevTools Elements panel. Reduce nested elements and virtualize long lists.",
-            "None", "Monitor for regression"
-    );
-
-    // User impact templates keyed by which metric is worst
-    private static final Map<String, String> IMPACT_TEMPLATES = Map.of(
-            "LCP", "Users wait %sms before main content appears",
-            "FCP", "Users see a blank screen for %sms before first paint",
-            "TTFB", "Users wait %sms for server to begin responding",
-            "CLS", "Users experience unexpected layout shifts (CLS %s)",
-            "Score", "Overall degraded experience (Score %s)"
-    );
-
     private static void appendCriticalFindingsPanel(StringBuilder sb, RenderConfig config,
-                                                     List<String[]> metricsTable) {
+                                                    List<String[]> metricsTable) {
         sb.append("<h2>Critical Findings</h2>\n");
 
         List<String[]> findings = new ArrayList<>();
@@ -650,21 +923,20 @@ public final class BpmHtmlReportRenderer {
         sb.append("</tbody>\n</table>\n</div>\n</div>\n");
     }
 
+    // ── Paginated table helper ──────────────────────────────────────────────
+
     private static String col(String[] row, int idx) {
         return idx < row.length ? row[idx] : "";
     }
 
     private static void addIssue(List<String> issues, String metric, String value,
-                                  String unit, String verdict) {
+                                 String unit, String verdict) {
         if ("POOR".equals(verdict)) {
             issues.add(metric + " " + value + unit + " (Fail)");
         } else if ("NEEDS_WORK".equals(verdict)) {
             issues.add(metric + " " + value + unit + " (Warning)");
         }
     }
-
-    // Metric names in same order as verdicts/values arrays: Score, LCP, FCP, TTFB, CLS
-    private static final String[] IMPACT_METRIC_NAMES = {"Score", "LCP", "FCP", "TTFB", "CLS"};
 
     private static String buildImpact(String[] verdicts, String[] values) {
         // Pick the worst metric to describe impact (prefer POOR over NEEDS_WORK)
@@ -678,40 +950,8 @@ public final class BpmHtmlReportRenderer {
         return "Performance below target";
     }
 
-    // ── Paginated table helper ──────────────────────────────────────────────
-
-    private static final String[] METRICS_HEADER_TOOLTIPS = {
-            "Transaction/sampler name",
-            "Number of samples collected",
-            "Performance score (0-100). Higher is better",
-            "Render Time \u2014 client-side rendering duration (LCP \u2212 TTFB)",
-            "Server Ratio \u2014 percentage of load time spent on server response",
-            "Frontend Time \u2014 browser processing time (FCP \u2212 TTFB)",
-            "FCP-LCP Gap \u2014 delay between first paint and largest content",
-            "Layout stability category based on CLS",
-            "Percentage of SLA budget remaining before breach",
-            "Pre-computed bottleneck classification",
-            "First Contentful Paint \u2014 time until first text/image appears",
-            "Largest Contentful Paint \u2014 time until main content is visible",
-            "Cumulative Layout Shift \u2014 measures unexpected content movement",
-            "Time To First Byte \u2014 server processing + network latency",
-            "Average network requests per sample",
-            "Average transfer size per sample",
-            "Total JavaScript errors",
-            "Total console warnings"
-    };
-
-    private static final Map<String, String> IMPROVEMENT_AREA_TOOLTIPS = Map.of(
-            "Fix Network Failures", "Check failed requests in DevTools Network tab (filter by status 4xx/5xx). Verify CDN and third-party resource availability.",
-            "Reduce Server Response", "Profile backend response time. Check database queries, API calls, and caching headers via DevTools Timing tab.",
-            "Optimise Heavy Assets", "Identify largest resources via DevTools Network tab (sort by Size). Compress images (WebP/AVIF), lazy-load below-fold content.",
-            "Reduce Render Work", "Profile main thread in DevTools Performance tab. Look for long JavaScript tasks (>50ms) blocking rendering.",
-            "Reduce DOM Complexity", "Check DOM node count in DevTools (Elements panel). Reduce nested elements and virtualize long lists.",
-            "None", "Performance is balanced \u2014 no single bottleneck identified."
-    );
-
     private static void appendPaginatedTable(StringBuilder sb, RenderConfig config,
-                                              List<String[]> table, String tableId) {
+                                             List<String[]> table, String tableId) {
         sb.append("<div class=\"paginated-tbl\" data-table-id=\"").append(tableId).append("\">\n");
         sb.append("<div class=\"tbl-controls\"><label>Show:&nbsp;</label><select class=\"row-limit\" data-for=\"").append(tableId).append("\">\n");
         for (int v : new int[]{10, 25, 50, 100}) {
@@ -798,6 +1038,8 @@ public final class BpmHtmlReportRenderer {
         }
     }
 
+    // ── Charts panel ────────────────────────────────────────────────────────
+
     private static void appendMetricDescriptions(StringBuilder sb) {
         sb.append("<div class=\"metric-desc\">\n");
         sb.append("<h3>Column Descriptions</h3>\n");
@@ -812,8 +1054,6 @@ public final class BpmHtmlReportRenderer {
         sb.append("<dt>Improvement Area</dt><dd>Pre-computed bottleneck classification for this page.</dd>\n");
         sb.append("</dl>\n</div>\n");
     }
-
-    // ── Charts panel ────────────────────────────────────────────────────────
 
     private static void appendChartsPanel(StringBuilder sb, RenderConfig config,
                                           List<BpmTimeBucket> timeBuckets,
@@ -983,7 +1223,7 @@ public final class BpmHtmlReportRenderer {
      * Emits JS arrays for a set of time buckets: {prefix}Labels, {prefix}Scores, etc.
      */
     private static void appendBucketDataset(StringBuilder sb, String prefix,
-                                             List<BpmTimeBucket> buckets) {
+                                            List<BpmTimeBucket> buckets) {
         List<String> labels = new ArrayList<>();
         List<String> scores = new ArrayList<>();
         List<String> lcpVals = new ArrayList<>();
@@ -1014,13 +1254,15 @@ public final class BpmHtmlReportRenderer {
         sb.append("  var ").append(prefix).append("Render = [").append(String.join(",", renderVals)).append("];\n");
     }
 
+    // ── Metadata JS object ──────────────────────────────────────────────────
+
     private static String formatInterval(int seconds) {
         if (seconds >= 3600 && seconds % 3600 == 0) return (seconds / 3600) + "-hour";
         if (seconds >= 60 && seconds % 60 == 0) return (seconds / 60) + "-minute";
         return seconds + "-second";
     }
 
-    // ── Metadata JS object ──────────────────────────────────────────────────
+    // ── Panel-switching script ──────────────────────────────────────────────
 
     private static void appendMetaScript(StringBuilder sb, RenderConfig config) {
         sb.append("<script>\nwindow.bpmMeta = {\n");
@@ -1034,7 +1276,7 @@ public final class BpmHtmlReportRenderer {
         sb.append("};\n</script>\n");
     }
 
-    // ── Panel-switching script ──────────────────────────────────────────────
+    // ── Table script (pagination + sorting) ───────────────────────────────
 
     private static void appendPanelScript(StringBuilder sb) {
         sb.append("<script>\n(function() {\n");
@@ -1053,7 +1295,7 @@ public final class BpmHtmlReportRenderer {
         sb.append("})();\n</script>\n");
     }
 
-    // ── Table script (pagination + sorting) ───────────────────────────────
+    // ── Search filter script ───────────────────────────────────────────────
 
     private static void appendTableScript(StringBuilder sb) {
         sb.append("<script>\n(function() {\n");
@@ -1145,7 +1387,7 @@ public final class BpmHtmlReportRenderer {
         sb.append("})();\n</script>\n");
     }
 
-    // ── Search filter script ───────────────────────────────────────────────
+    // ── Excel export script ─────────────────────────────────────────────────
 
     private static void appendSearchScript(StringBuilder sb) {
         sb.append("<script>\n(function() {\n");
@@ -1175,7 +1417,7 @@ public final class BpmHtmlReportRenderer {
         sb.append("})();\n</script>\n");
     }
 
-    // ── Excel export script ─────────────────────────────────────────────────
+    // ── CSS ─────────────────────────────────────────────────────────────────
 
     private static void appendExcelScript(StringBuilder sb) {
         sb.append("<script>\n(function() {\n");
@@ -1229,246 +1471,6 @@ public final class BpmHtmlReportRenderer {
         sb.append("  window.exportExcel = exportExcel;\n");
         sb.append("})();\n</script>\n");
     }
-
-    // ── CSS ─────────────────────────────────────────────────────────────────
-
-    private static final String CSS = """
-              <style>
-                :root {
-                  --color-text-primary:         #1a202c;
-                  --color-text-secondary:       #4a5568;
-                  --color-text-tertiary:        #718096;
-                  --color-background-primary:   #ffffff;
-                  --color-background-secondary: #f7fafc;
-                  --color-background-tertiary:  #f0f4f8;
-                  --color-border-secondary:     #cbd5e0;
-                  --color-border-tertiary:      #e2e8f0;
-                  --color-pass:                 #38a169;
-                  --color-warning:              #d69e2e;
-                  --color-fail:                 #e53e3e;
-                }
-                *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-                html, body { height: 100%; }
-                .rpt {
-                  font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px;
-                  line-height: 1.7; color: var(--color-text-primary);
-                  background: var(--color-background-tertiary);
-                  display: flex; flex-direction: column; min-height: 100vh;
-                }
-
-                /* ── Header ────────────────────────────────────────────────── */
-                .rpt-header {
-                  background: #1a365d;
-                  color: white; padding: 24px 32px;
-                  display: flex; align-items: flex-start; justify-content: space-between;
-                  gap: 24px; flex-shrink: 0;
-                }
-                .header-left { flex: 1; min-width: 0; }
-                .rpt-header h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; color: white; }
-                .sub { font-size: 12px; color: rgba(255,255,255,0.7); margin-bottom: 8px; }
-                .meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 2px 16px; font-size: 12px; }
-                .ml { color: rgba(255,255,255,0.6); font-weight: 500; white-space: nowrap; }
-                .mv { color: white; }
-                .header-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; flex-shrink: 0; padding-top: 4px; }
-                .exp-btn {
-                  width: 148px; padding: 7px 0;
-                  border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
-                  cursor: pointer; border-radius: 5px; font-size: 13px; font-family: inherit;
-                  color: white; white-space: nowrap; line-height: 1.3; text-align: center;
-                  transition: background 0.15s;
-                }
-                .exp-btn:hover { background: rgba(255,255,255,0.22); }
-
-                /* ── Layout ─────────────────────────────────────────────────── */
-                .body-row { display: flex; align-items: stretch; flex: 1; }
-                .sidebar {
-                  width: 210px; flex-shrink: 0; background: #f0f4f8;
-                  border-right: 1px solid #cbd5e0; padding: 12px 0;
-                  position: sticky; top: 0; align-self: flex-start;
-                  height: 100vh; overflow-y: auto;
-                }
-                .nav-item {
-                  display: block; width: 100%; padding: 10px 20px; border: none;
-                  background: transparent; text-align: left; font-size: 13px;
-                  font-family: inherit; color: #4a5568; cursor: pointer;
-                  line-height: 1.4; border-left: 3px solid transparent;
-                  transition: all 0.12s;
-                }
-                .nav-item:hover  { background: #e2e8f0; color: #2d3748; }
-                .nav-item.active { background: #fff; color: #1a365d; font-weight: 600; border-left: 3px solid #1a365d; }
-                .main-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-                .content-area { flex: 1; padding: 28px 32px; background: var(--color-background-primary); overflow: auto; }
-                .panel       { display: none; }
-                .panel.active { display: block; }
-
-                /* ── Typography ─────────────────────────────────────────────── */
-                h2 {
-                  font-size: 16px; font-weight: 600; color: var(--color-text-primary);
-                  border-left: 3px solid #3182ce; padding-left: 11px; margin: 0 0 16px;
-                }
-                h3 {
-                  font-size: 14px; font-weight: 600; color: #2d3748; margin: 20px 0 8px;
-                  padding-bottom: 6px; border-bottom: 1px solid var(--color-border-tertiary);
-                }
-                p  { margin-bottom: 12px; font-size: 13px; color: var(--color-text-primary); }
-                code { background: #edf2f7; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 12px; color: #c53030; }
-                pre  { background: #2d3748; color: #e2e8f0; padding: 14px 18px; border-radius: 6px; overflow-x: auto; margin: 12px 0 18px; }
-                pre code { background: none; color: inherit; padding: 0; }
-                blockquote { border-left: 4px solid #63b3ed; margin: 14px 0; padding: 10px 16px; background: #ebf8ff; border-radius: 0 6px 6px 0; font-size: 13px; }
-                strong { font-weight: 700; }
-
-                /* ── Tables ──────────────────────────────────────────────────── */
-                .tbl-wrap { overflow-x: auto; margin: 12px 0 20px; border-radius: 6px; border: 0.5px solid var(--color-border-secondary); }
-                table { border-collapse: collapse; width: 100%; background: var(--color-background-primary); font-size: 12px; }
-                th {
-                  background: #2d3748; color: white; padding: 8px 12px;
-                  text-align: left; font-size: 11px; font-weight: 600;
-                  text-transform: uppercase; letter-spacing: 0.4px; white-space: nowrap;
-                  position: sticky; top: 0; z-index: 1;
-                }
-                td { padding: 7px 12px; border-bottom: 0.5px solid var(--color-border-tertiary); white-space: nowrap; }
-                td.sla-pass, span.sla-pass { text-align: center; font-weight: 600; color: #276749; }
-                td.sla-fail, span.sla-fail { text-align: center; font-weight: 700; color: #c53030; }
-                td.sla-warn, span.sla-warn { text-align: center; font-weight: 600; color: #b7791f; }
-                td.sla-na   { text-align: center; color: #a0aec0; }
-                td.num { text-align: right; font-variant-numeric: tabular-nums; }
-                tr:last-child td  { border-bottom: none; }
-                tr:nth-child(even) td { background: var(--color-background-secondary); }
-                tr.total-row td { font-weight: 700; background: #edf2f7; border-top: 2px solid var(--color-border-secondary); }
-                td.label-cell { font-weight: 500; }
-                .tbl-controls { margin-bottom: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; }
-                .tbl-controls select { padding: 3px 6px; border: 1px solid var(--color-border-secondary); border-radius: 4px; font-size: 12px; font-family: inherit; }
-                .tbl-scroll { overflow-y: auto; overflow-x: auto; }
-                th.sort-asc::after { content: ' \\25B2'; font-size: 9px; }
-                th.sort-desc::after { content: ' \\25BC'; font-size: 9px; }
-                th:hover { background: #4a5568; }
-                .pager { margin: 8px 0; font-size: 12px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-                .pg-btn {
-                  padding: 3px 8px; border: 1px solid var(--color-border-secondary); border-radius: 3px;
-                  background: var(--color-background-primary); cursor: pointer; font-size: 11px; font-family: inherit;
-                }
-                .pg-btn:hover:not(:disabled) { background: #e2e8f0; }
-                .pg-btn:disabled { opacity: 0.4; cursor: default; }
-                .pg-active { background: #1a365d; color: white; border-color: #1a365d; }
-                .pg-active:hover { background: #2a4365; }
-                .pg-info { font-size: 11px; color: var(--color-text-tertiary); margin-left: 8px; }
-                [data-table-id="cf"] td,
-                [data-table-id="recs"] td { white-space: normal; }
-                [data-table-id="cf"] td:nth-child(1),
-                [data-table-id="cf"] td:nth-child(2),
-                [data-table-id="recs"] td:nth-child(1),
-                [data-table-id="recs"] td:nth-child(3) { white-space: nowrap; }
-                [data-table-id="cf"] .tbl-scroll,
-                [data-table-id="recs"] .tbl-scroll { max-height: 520px; }
-                .sla-summary { font-size: 13px; margin-bottom: 12px; font-weight: 500; }
-                .sla-pass-summary { color: #276749; }
-                .sla-fail-summary { color: #c53030; }
-                .metric-desc { margin-top: 20px; padding: 14px 16px; background: var(--color-background-secondary); border: 1px solid var(--color-border-tertiary); border-radius: 6px; }
-                .metric-desc h3 { font-size: 12px; margin: 0 0 8px; border: none; padding: 0; }
-                .metric-desc dl { font-size: 12px; margin: 0; }
-                .metric-desc dt { font-weight: 600; color: var(--color-text-primary); margin-top: 6px; }
-                .metric-desc dd { color: var(--color-text-secondary); margin-left: 0; margin-bottom: 2px; }
-                .sla-thresholds { margin-top: 14px; font-size: 11px; color: var(--color-text-tertiary); line-height: 1.6; }
-                .tbl-search { margin-bottom: 10px; }
-                .tbl-search input {
-                  padding: 6px 10px; border: 1px solid var(--color-border-secondary); border-radius: 4px;
-                  font-size: 12px; font-family: inherit; width: 260px;
-                  transition: border-color 0.15s;
-                }
-                .tbl-search input:focus { outline: none; border-color: #3182ce; box-shadow: 0 0 0 2px rgba(49,130,206,0.15); }
-
-                /* ── Lists ──────────────────────────────────────────────────── */
-                ul, ol { margin: 8px 0 14px 22px; font-size: 13px; }
-                li { margin-bottom: 5px; }
-                li strong { color: #2d3748; }
-
-                /* ── Executive Summary: actionable finding cards ─────────────── */
-                .panel ul { list-style: none; margin-left: 0; padding: 0; }
-                .panel ul li {
-                  background: var(--color-background-secondary);
-                  border: 1px solid var(--color-border-tertiary);
-                  border-left: 4px solid #2b6cb0;
-                  border-radius: 0 6px 6px 0;
-                  padding: 10px 14px; margin-bottom: 10px;
-                }
-                .panel ol { list-style: decimal; margin-left: 22px; }
-                .panel ol li {
-                  background: transparent; border: none; border-left: none;
-                  border-radius: 0; padding: 0; margin-bottom: 5px;
-                }
-
-                /* ── Critical Findings: severity-colored cards ──────────────── */
-                .panel h3 + ul { margin-top: 0; }
-                .panel h3 + ul li {
-                  border-left-color: var(--color-warning);
-                }
-
-                /* ── KPI Cards (first panel) ────────────────────────────────── */
-                .metadata-grid.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-bottom: 24px; }
-                .kpi {
-                  background: var(--color-background-secondary); border-radius: 8px;
-                  padding: 14px 16px; border: 1px solid var(--color-border-tertiary);
-                  transition: box-shadow 0.15s;
-                }
-                .kpi:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-                .kpi-label { font-size: 10px; color: var(--color-text-secondary); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
-                .kpi-value { font-size: 20px; font-weight: 500; color: var(--color-text-primary); line-height: 1.2; }
-                .kpi-value.pass { color: #276749; font-weight: 700; }
-                .kpi-value.fail { color: #c53030; font-weight: 700; }
-
-                /* ── Charts ─────────────────────────────────────────────────── */
-                .charts-section  { margin: 0; }
-                .charts-note { font-size: 11px; color: var(--color-text-tertiary); margin-bottom: 12px; }
-                .chart-filter { margin-bottom: 16px; font-size: 13px; }
-                .chart-filter select { padding: 4px 8px; border: 1px solid var(--color-border-secondary); border-radius: 4px; font-size: 12px; font-family: inherit; }
-                .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 4px; }
-                .chart-box {
-                  background: var(--color-background-secondary); border: 1px solid var(--color-border-tertiary);
-                  border-radius: 8px; padding: 16px 18px 12px;
-                  transition: box-shadow 0.15s;
-                }
-                .chart-box:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-                .chart-box h3 { font-size: 12px; font-weight: 600; color: var(--color-text-secondary); margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.4px; border: none; padding: 0; }
-                .chart-canvas-wrap { position: relative; height: 220px; }
-
-                /* ── Footer ─────────────────────────────────────────────────── */
-                .footer-rpt {
-                  font-size: 11px; color: var(--color-text-tertiary); padding: 12px 32px;
-                  border-top: 1px solid var(--color-border-tertiary);
-                  background: var(--color-background-primary); flex-shrink: 0;
-                }
-
-                /* ── Responsive ─────────────────────────────────────────────── */
-                @media (max-width: 768px) {
-                  .sidebar { display: none; }
-                  .content-area { padding: 16px; }
-                  .rpt-header { flex-direction: column; padding: 16px; }
-                  .charts-grid { grid-template-columns: 1fr; }
-                }
-
-                /* ── Print / PDF ────────────────────────────────────────────── */
-                @media print {
-                  .sidebar { display: none !important; }
-                  .body-row { display: block; }
-                  .main-col { display: block; }
-                  .panel { display: block !important; page-break-inside: avoid; margin-bottom: 24px; }
-                  .rpt-header { background: #1a365d !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-                  .header-actions { display: none; }
-                  .tbl-search { display: none; }
-                  .tbl-controls { display: none; }
-                  .chart-filter { display: none; }
-                  .tbl-scroll { max-height: none !important; overflow: visible !important; }
-                  .content-area { padding: 16px; overflow: visible; }
-                  .rpt { min-height: auto; }
-                  .footer-rpt { position: relative; }
-                  table { font-size: 10px; }
-                  th, td { padding: 4px 8px; }
-                  .charts-grid { grid-template-columns: 1fr; }
-                  .chart-canvas-wrap { height: 180px; }
-                  canvas { max-width: 100%; }
-                }
-              </style>
-            """;
 
     // ── Utilities ────────────────────────────────────────────────────────────
 

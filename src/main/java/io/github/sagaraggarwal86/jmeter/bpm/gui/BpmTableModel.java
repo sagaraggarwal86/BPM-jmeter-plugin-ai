@@ -248,7 +248,8 @@ public class BpmTableModel extends AbstractTableModel {
                 case BpmConstants.COL_IDX_STABILITY -> lastStabilityCategory != null ? lastStabilityCategory : "\u2014";
                 case BpmConstants.COL_IDX_HEADROOM ->
                         headroomCount > 0 ? (int) (totalHeadroom / headroomCount) + "%" : "\u2014";
-                case BpmConstants.COL_IDX_IMPROVEMENT_AREA -> "TOTAL".equals(label) ? "" : lastImprovementArea;
+                case BpmConstants.COL_IDX_IMPROVEMENT_AREA -> "TOTAL".equals(label) ? ""
+                        : BpmConstants.BOTTLENECK_NONE.equals(lastImprovementArea) ? "\u2014" : lastImprovementArea;
                 case BpmConstants.COL_IDX_FCP -> totalFcp / n;
                 case BpmConstants.COL_IDX_LCP -> totalLcp / n;
                 case BpmConstants.COL_IDX_CLS -> String.format("%.3f", totalCls / n);

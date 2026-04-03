@@ -72,6 +72,71 @@ class BpmErrorHandlerTest {
         assertEquals(0, handler.getReInitCount());
     }
 
+    @Test
+    @DisplayName("resetThread transitions DISABLED → HEALTHY and clears log-once entries")
+    void resetThread_recoversFromDisabled() {
+        handler.handleCollectionError("Thread-1", new RuntimeException("error"));
+        handler.handleSessionError("Thread-1", new RuntimeException("re-init failed"));
+        assertTrue(handler.isThreadDisabled("Thread-1"));
+        assertTrue(tracker.hasWarned("Thread-1", "session-disabled"));
+
+        handler.resetThread("Thread-1");
+
+        assertEquals(BpmErrorHandler.ThreadState.HEALTHY, handler.getThreadState("Thread-1"));
+        assertFalse(handler.isThreadDisabled("Thread-1"));
+        // Log-once entries for this thread should be cleared
+        assertFalse(tracker.hasWarned("Thread-1", "session-disabled"));
+    }
+
+    @Test
+    @DisplayName("resetThread does not affect other threads")
+    void resetThread_isolatedToThread() {
+        handler.handleCollectionError("Thread-1", new RuntimeException("error"));
+        handler.handleSessionError("Thread-1", new RuntimeException("fail"));
+        handler.handleCollectionError("Thread-2", new RuntimeException("error"));
+        handler.handleSessionError("Thread-2", new RuntimeException("fail"));
+
+        handler.resetThread("Thread-1");
+
+        assertEquals(BpmErrorHandler.ThreadState.HEALTHY, handler.getThreadState("Thread-1"));
+        assertTrue(handler.isThreadDisabled("Thread-2"));
+    }
+
+    @Test
+    @DisplayName("Collection error on already RE_INIT_NEEDED thread stays RE_INIT_NEEDED")
+    void collectionError_onReInitNeeded_staysReInitNeeded() {
+        handler.handleCollectionError("Thread-1", new RuntimeException("first"));
+        handler.handleCollectionError("Thread-1", new RuntimeException("second"));
+        assertEquals(BpmErrorHandler.ThreadState.RE_INIT_NEEDED, handler.getThreadState("Thread-1"));
+        assertEquals(2, handler.getFailureCount());
+    }
+
+    @Test
+    @DisplayName("Collection error on DISABLED thread stays DISABLED and increments failure count")
+    void collectionError_onDisabled_staysDisabled() {
+        handler.handleCollectionError("Thread-1", new RuntimeException("err"));
+        handler.handleSessionError("Thread-1", new RuntimeException("fail"));
+        int countBefore = handler.getFailureCount();
+        handler.handleCollectionError("Thread-1", new RuntimeException("another"));
+        assertTrue(handler.isThreadDisabled("Thread-1"));
+        assertEquals(countBefore + 1, handler.getFailureCount());
+    }
+
+    @Test
+    @DisplayName("resetThread on non-existent thread is a no-op")
+    void resetThread_nonExistentThread_noOp() {
+        assertDoesNotThrow(() -> handler.resetThread("Thread-99"));
+        assertEquals(BpmErrorHandler.ThreadState.HEALTHY, handler.getThreadState("Thread-99"));
+    }
+
+    @Test
+    @DisplayName("Failure count accumulates across collection and session errors")
+    void failureCount_accumulatesAcrossErrorTypes() {
+        handler.handleCollectionError("Thread-1", new RuntimeException("a"));
+        handler.handleSessionError("Thread-1", new RuntimeException("b"));
+        assertEquals(2, handler.getFailureCount());
+    }
+
     // LogOnceTracker tests
 
     @Test
@@ -101,5 +166,52 @@ class BpmErrorHandlerTest {
         tracker.reset();
         assertFalse(tracker.hasWarned("Thread-1", "key"));
         assertEquals(0, tracker.getLoggedCount());
+    }
+
+    @Test
+    @DisplayName("LogOnceTracker resetThread clears only that thread's warnings")
+    void trackerResetThread_clearsOnlyTargetThread() {
+        tracker.warnOnce("Thread-1", "key-a", "msg");
+        tracker.warnOnce("Thread-1", "key-b", "msg");
+        tracker.warnOnce("Thread-2", "key-a", "msg");
+        assertEquals(3, tracker.getLoggedCount());
+
+        tracker.resetThread("Thread-1");
+
+        assertFalse(tracker.hasWarned("Thread-1", "key-a"));
+        assertFalse(tracker.hasWarned("Thread-1", "key-b"));
+        assertTrue(tracker.hasWarned("Thread-2", "key-a"));
+        assertEquals(1, tracker.getLoggedCount());
+    }
+
+    @Test
+    @DisplayName("LogOnceTracker resetThread allows re-logging for the same thread")
+    void trackerResetThread_allowsRelogging() {
+        tracker.warnOnce("Thread-1", "key-a", "msg");
+        assertTrue(tracker.hasWarned("Thread-1", "key-a"));
+
+        tracker.resetThread("Thread-1");
+        assertFalse(tracker.hasWarned("Thread-1", "key-a"));
+
+        // Should be able to log again
+        tracker.warnOnce("Thread-1", "key-a", "msg again");
+        assertTrue(tracker.hasWarned("Thread-1", "key-a"));
+        assertEquals(1, tracker.getLoggedCount());
+    }
+
+    @Test
+    @DisplayName("LogOnceTracker resetThread on thread with no warnings is safe")
+    void trackerResetThread_noWarnings_safe() {
+        assertDoesNotThrow(() -> tracker.resetThread("Thread-99"));
+        assertEquals(0, tracker.getLoggedCount());
+    }
+
+    @Test
+    @DisplayName("LogOnceTracker markOnce returns true first time and false thereafter")
+    void trackerMarkOnce_firstTrueThenFalse() {
+        assertTrue(tracker.markOnce("Thread-1", "reinit-success"));
+        assertFalse(tracker.markOnce("Thread-1", "reinit-success"));
+        // Different thread, same key — first time
+        assertTrue(tracker.markOnce("Thread-2", "reinit-success"));
     }
 }

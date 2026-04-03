@@ -45,6 +45,18 @@ public final class LogOnceTracker {
     }
 
     /**
+     * Marks a thread+key combination as seen and returns whether this is the first time.
+     * Does not log anything — the caller decides how to log based on the return value.
+     *
+     * @param threadName the JMeter thread name
+     * @param key        a short identifier for the event category
+     * @return {@code true} if this is the first occurrence; {@code false} if already seen
+     */
+    public boolean markOnce(String threadName, String key) {
+        return loggedWarnings.add(threadName + KEY_SEPARATOR + key);
+    }
+
+    /**
      * Checks whether a warning has already been logged for the given thread and key.
      *
      * @param threadName the JMeter thread name
@@ -53,6 +65,18 @@ public final class LogOnceTracker {
      */
     public boolean hasWarned(String threadName, String warningKey) {
         return loggedWarnings.contains(threadName + KEY_SEPARATOR + warningKey);
+    }
+
+    /**
+     * Clears all tracked warnings for a specific thread, allowing those
+     * warnings to be logged again. Used when a thread recovers from
+     * {@code DISABLED} state after a new browser is detected.
+     *
+     * @param threadName the JMeter thread name
+     */
+    public void resetThread(String threadName) {
+        String prefix = threadName + KEY_SEPARATOR;
+        loggedWarnings.removeIf(key -> key.startsWith(prefix));
     }
 
     /**

@@ -27,6 +27,16 @@ public final class BpmConstants {
      */
     public static final String VAR_BPM_EVENT_BUFFER = "BPM_EventBuffer";
     /**
+     * JMeterVariables key for the last collected {@code BpmResult}.
+     * Set by {@code BpmCollector}, read by all {@code BpmListener} instances.
+     */
+    public static final String VAR_BPM_RESULT = "BPM_Result";
+    /**
+     * JMeterVariables key for the {@code SampleResult} identity that produced the cached
+     * {@code BpmResult}. Used to detect "already collected for this sample" across listeners.
+     */
+    public static final String VAR_BPM_LAST_SAMPLE = "BPM_LastSample";
+    /**
      * JSONL schema version embedded in every output record.
      */
     public static final String SCHEMA_VERSION = "1.0";
@@ -67,12 +77,16 @@ public final class BpmConstants {
      */
     public static final String TEST_ELEMENT_CHART_INTERVAL = "bpm.chartInterval";
     /**
+     * TestElement property key: per-element column visibility as comma-separated booleans.
+     * Persisted in .jmx so each listener retains its own column selection across saves/loads.
+     */
+    public static final String TEST_ELEMENT_COLUMN_VISIBILITY = "bpm.columnVisibility";
+    /**
      * TestElement property key: stable UUID assigned once at element creation.
-     * Clones inherit this value, so it uniquely identifies a distinct element across
-     * all clone instances created by JMeter for Thread Group parallelism.
-     * Used as the key in {@code BpmListener.primaryByName} to allow multiple distinct
-     * BpmListener elements in one test plan to each run their own setup independently.
-     */ // CHANGED: Defect — per-element UUID for clone-safe primaryByName lookup
+     * Uniquely identifies a distinct element. Used as the key in
+     * {@code BpmListener.primaryByName} to allow multiple distinct BpmListener
+     * elements in one test plan to each run their own setup independently.
+     */
     public static final String TEST_ELEMENT_ID = "bpm.elementId";
     /**
      * Property key: enable/disable Web Vitals metric collection tier.
