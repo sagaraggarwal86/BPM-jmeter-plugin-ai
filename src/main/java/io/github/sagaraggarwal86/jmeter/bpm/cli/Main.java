@@ -11,7 +11,7 @@ import java.nio.file.Path;
  * <p>Generates an AI-powered browser performance analysis report from a
  * BPM JSONL results file produced by JMeter with the BPM plugin.</p>
  *
- * <h3>Workflow</h3>
+ * <h2>Workflow</h2>
  * <pre>{@code
  * # Step 1: Run JMeter test (standard non-GUI mode)
  * jmeter -n -t test.jmx -l results.jtl -Jbpm.output=bpm-results.jsonl
@@ -20,7 +20,7 @@ import java.nio.file.Path;
  * bpm-ai-report -i bpm-results.jsonl --provider groq
  * }</pre>
  *
- * <h3>Exit codes</h3>
+ * <h2>Exit codes</h2>
  * <ul>
  *   <li>{@code 0} — Success: report generated</li>
  *   <li>{@code 1} — Invalid command-line arguments</li>
