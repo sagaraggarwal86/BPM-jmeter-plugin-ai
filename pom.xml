@@ -160,7 +160,7 @@
             <!-- Markdown to HTML rendering for AI-generated reports -->
             <groupId>org.commonmark</groupId>
             <artifactId>commonmark</artifactId>
-            <version>0.24.0</version>
+            <version>0.28.0</version>
         </dependency>
         <dependency>
             <!-- GFM tables extension for pipe-table rendering in AI reports -->
