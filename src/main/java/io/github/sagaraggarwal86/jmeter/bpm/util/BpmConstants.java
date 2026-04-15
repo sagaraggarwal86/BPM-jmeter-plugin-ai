@@ -687,7 +687,7 @@ public final class BpmConstants {
      * URL opened by the Help button in the info bar.
      */
     public static final String HELP_URL =
-            "https://github.com/sagaraggarwal86/BPM-jmeter-plugin#readme";
+            "https://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai#readme";
     /**
      * Info-bar text shown when Selenium/WebDriver classes are absent (Scenario A).
      */

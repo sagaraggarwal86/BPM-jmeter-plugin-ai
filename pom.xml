@@ -9,7 +9,7 @@
          Project coordinates
     ============================================================= -->
     <groupId>io.github.sagaraggarwal86</groupId>
-    <artifactId>bpm-jmeter-plugin</artifactId>
+    <artifactId>bpm-jmeter-plugin-ai</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
@@ -21,7 +21,7 @@
         improvement area detection, and optional AI-powered analysis reports with
         time-series trend charts via a CLI tool (bpm-ai-report) supporting 7 AI providers .
     </description>
-    <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin</url>
+    <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai</url>
     <inceptionYear>2026</inceptionYear>
 
     <!-- =============================================================
@@ -54,9 +54,9 @@
          SCM
     ============================================================= -->
     <scm>
-        <connection>scm:git:git://github.com/sagaraggarwal86/BPM-jmeter-plugin.git</connection>
-        <developerConnection>scm:git:ssh://github.com/sagaraggarwal86/BPM-jmeter-plugin.git</developerConnection>
-        <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin</url>
+        <connection>scm:git:git://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai.git</connection>
+        <developerConnection>scm:git:ssh://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai.git</developerConnection>
+        <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai</url>
         <tag>HEAD</tag>
     </scm>
 
