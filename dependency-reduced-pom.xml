@@ -2,15 +2,15 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>io.github.sagaraggarwal86</groupId>
-  <artifactId>bpm-jmeter-plugin</artifactId>
+  <artifactId>bpm-jmeter-plugin-ai</artifactId>
   <name>Browser Performance Metrics (BPM)</name>
-  <version>0.1.2</version>
+  <version>1.0.0</version>
   <description>JMeter listener plugin that captures browser rendering metrics (Core Web Vitals, network,
         runtime, console errors) from WebDriver Sampler executions via Chrome DevTools Protocol.
         Provides a live results table with SLA-based highlighting, a composite performance score,
         improvement area detection, and optional AI-powered analysis reports with
         time-series trend charts via a CLI tool (bpm-ai-report) supporting 7 AI providers .</description>
-  <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin</url>
+  <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai</url>
   <inceptionYear>2026</inceptionYear>
   <developers>
     <developer>
@@ -31,9 +31,9 @@
     </license>
   </licenses>
   <scm>
-    <connection>scm:git:git://github.com/sagaraggarwal86/BPM-jmeter-plugin.git</connection>
-    <developerConnection>scm:git:ssh://github.com/sagaraggarwal86/BPM-jmeter-plugin.git</developerConnection>
-    <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin</url>
+    <connection>scm:git:git://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai.git</connection>
+    <developerConnection>scm:git:ssh://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai.git</developerConnection>
+    <url>https://github.com/sagaraggarwal86/BPM-jmeter-plugin-ai</url>
   </scm>
   <build>
     <pluginManagement>
@@ -110,7 +110,7 @@
       </plugin>
       <plugin>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.6.0</version>
+        <version>3.6.2</version>
         <executions>
           <execution>
             <phase>package</phase>
@@ -309,7 +309,7 @@
     <dependency>
       <groupId>org.seleniumhq.selenium</groupId>
       <artifactId>selenium-chrome-driver</artifactId>
-      <version>4.13.0</version>
+      <version>4.43.0</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
@@ -341,7 +341,7 @@
     <dependency>
       <groupId>org.mockito</groupId>
       <artifactId>mockito-core</artifactId>
-      <version>5.14.2</version>
+      <version>5.23.0</version>
       <scope>test</scope>
       <exclusions>
         <exclusion>
@@ -357,7 +357,7 @@
     <dependency>
       <groupId>org.mockito</groupId>
       <artifactId>mockito-junit-jupiter</artifactId>
-      <version>5.14.2</version>
+      <version>5.23.0</version>
       <scope>test</scope>
       <exclusions>
         <exclusion>
@@ -390,7 +390,7 @@
     <maven-source-plugin.version>3.4.0</maven-source-plugin.version>
     <maven-gpg-plugin.version>3.2.8</maven-gpg-plugin.version>
     <jackson.version>2.15.3</jackson.version>
-    <selenium.version>4.13.0</selenium.version>
+    <selenium.version>4.43.0</selenium.version>
     <maven-javadoc-plugin.version>3.12.0</maven-javadoc-plugin.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <junit.version>5.11.3</junit.version>
@@ -398,11 +398,11 @@
     <maven-jar-plugin.version>3.4.2</maven-jar-plugin.version>
     <maven.compiler.source>17</maven.compiler.source>
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
-    <mockito.version>5.14.2</mockito.version>
+    <mockito.version>5.23.0</mockito.version>
     <jacoco.line.coverage.minimum>0.84</jacoco.line.coverage.minimum>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <maven.compiler.target>17</maven.compiler.target>
-    <maven-enforcer-plugin.version>3.5.0</maven-enforcer-plugin.version>
+    <maven-enforcer-plugin.version>3.6.2</maven-enforcer-plugin.version>
     <maven-surefire-plugin.version>3.5.5</maven-surefire-plugin.version>
     <jmeter.version>5.6.3</jmeter.version>
   </properties>

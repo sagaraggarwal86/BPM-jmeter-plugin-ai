@@ -79,12 +79,12 @@ Search for "Browser Performance Metrics" in the Plugins Manager and install.
 ### Manual JAR
 
 1. Download the latest JAR from
-   [Maven Central](https://central.sonatype.com/artifact/io.github.sagaraggarwal86/bpm-jmeter-plugin)
-   or the [GitHub Releases](https://github.com/sagaraggarwal86/bpm-jmeter-plugin/releases) page.
+   [Maven Central](https://central.sonatype.com/artifact/io.github.sagaraggarwal86/bpm-jmeter-plugin-ai)
+   or the [GitHub Releases](https://github.com/sagaraggarwal86/bpm-jmeter-plugin-ai/releases) page.
 
 2. Copy it to your JMeter `lib/ext/` directory:
    ```
-   <JMETER_HOME>/lib/ext/bpm-jmeter-plugin-<version>.jar
+   <JMETER_HOME>/lib/ext/bpm-jmeter-plugin-ai-<version>.jar
    ```
 
 3. Restart JMeter.
@@ -122,10 +122,10 @@ Search for "Browser Performance Metrics" in the Plugins Manager and install.
 **Prerequisites:** Java 17+, Maven 3.8+
 
 ```bash
-git clone https://github.com/sagaraggarwal86/bpm-jmeter-plugin.git
-cd bpm-jmeter-plugin
+git clone https://github.com/sagaraggarwal86/bpm-jmeter-plugin-ai.git
+cd bpm-jmeter-plugin-ai
 mvn clean verify
-cp target/bpm-jmeter-plugin-*.jar $JMETER_HOME/lib/ext/
+cp target/bpm-jmeter-plugin-ai-*.jar $JMETER_HOME/lib/ext/
 ```
 
 ---
@@ -618,7 +618,7 @@ writing the new template. Check the backup for your customizations.
 ## Contributing
 
 Bug reports and pull requests are welcome via
-[GitHub Issues](https://github.com/sagaraggarwal86/bpm-jmeter-plugin/issues).
+[GitHub Issues](https://github.com/sagaraggarwal86/bpm-jmeter-plugin-ai/issues).
 
 Before submitting a pull request:
 

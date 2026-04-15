@@ -40,20 +40,20 @@ jobs:
       - name: Assemble distribution zip
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          DIR="bpm-jmeter-plugin-${VERSION}"
+          DIR="bpm-jmeter-plugin-ai-${VERSION}"
           mkdir -p "${DIR}"
-          cp target/bpm-jmeter-plugin-${VERSION}.jar "${DIR}/"
+          cp target/bpm-jmeter-plugin-ai-${VERSION}.jar "${DIR}/"
           cp src/main/scripts/bpm-ai-report.sh "${DIR}/"
           chmod +x "${DIR}/bpm-ai-report.sh"
           cp src/main/scripts/bpm-ai-report.bat "${DIR}/"
           cp docs/bpm.properties "${DIR}/"
           cp docs/ai-reporter.properties "${DIR}/"
-          zip -r "bpm-jmeter-plugin-${VERSION}.zip" "${DIR}"
+          zip -r "bpm-jmeter-plugin-ai-${VERSION}.zip" "${DIR}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: bpm-jmeter-plugin-*.zip
+          files: bpm-jmeter-plugin-ai-*.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
