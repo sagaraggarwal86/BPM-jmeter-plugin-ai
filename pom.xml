@@ -165,7 +165,7 @@
             <!-- GFM tables extension for pipe-table rendering in AI reports -->
             <groupId>org.commonmark</groupId>
             <artifactId>commonmark-ext-gfm-tables</artifactId>
-            <version>0.24.0</version>
+            <version>0.28.0</version>
         </dependency>
 
         <!-- ── Test ── -->
